@@ -1,0 +1,22 @@
+export const LAMP_SERVICE_UUID = '12340000-1234-5678-1234-56789abcdef0';
+
+export const LAMP_CHAR_UUIDS = {
+  power: '12340001-1234-5678-1234-56789abcdef0',
+  intensity: '12340002-1234-5678-1234-56789abcdef0',
+  hue: '12340003-1234-5678-1234-56789abcdef0',
+  pwmFreq: '12340004-1234-5678-1234-56789abcdef0',
+  timerOn: '12340005-1234-5678-1234-56789abcdef0',
+  timerOff: '12340006-1234-5678-1234-56789abcdef0',
+  timerEnable: '12340007-1234-5678-1234-56789abcdef0',
+  hueTime: '1234000d-1234-5678-1234-56789abcdef0',
+  hueFade: '1234000e-1234-5678-1234-56789abcdef0',
+  lampTime: '1234000f-1234-5678-1234-56789abcdef0',
+  lampTimeSynced: '12340010-1234-5678-1234-56789abcdef0',
+  securityStatus: '12340011-1234-5678-1234-56789abcdef0',
+  passkeyUpdate: '12340012-1234-5678-1234-56789abcdef0',
+  tempMcu: '12340008-1234-5678-1234-56789abcdef0',
+  tempBoard: '12340009-1234-5678-1234-56789abcdef0',
+  tempHeatsink: '1234000a-1234-5678-1234-56789abcdef0',
+  current: '1234000b-1234-5678-1234-56789abcdef0',
+  heartbeat: '1234000c-1234-5678-1234-56789abcdef0',
+} as const;

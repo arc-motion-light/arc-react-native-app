@@ -1,0 +1,11 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "types": ["react", "react-native"],
+    "lib": ["dom", "dom.iterable", "esnext"]
+  },
+  "exclude": ["android/app/arc_slider/ArcSlider.tsx"]
+}

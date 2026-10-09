@@ -1,0 +1,41 @@
+{
+  "expo": {
+    "name": "ARC",
+    "slug": "lamp-ble",
+    "scheme": "io.arcstore.app",
+    "version": "0.0.1",
+    "orientation": "default",
+    "userInterfaceStyle": "automatic",
+    "platforms": [
+      "android",
+      "ios",
+      "web"
+    ],
+    "android": {
+      "package": "com.example.lampble"
+    },
+    "ios": {
+      "bundleIdentifier": "io.arcstore.app",
+      "icon": "./ios/LampBLE/Images.xcassets/AppIcon.appiconset/App-Icon-1024x1024@1x.png",
+      "infoPlist": {
+        "NSBluetoothAlwaysUsageDescription": "Lamp BLE uses Bluetooth to scan, connect, provision, and control nearby ARC devices.",
+        "NSLocationWhenInUseUsageDescription": "Lamp BLE uses your location to calculate local sunrise and sunset times for light schedules.",
+        "UIBackgroundModes": [
+          "bluetooth-central"
+        ],
+        "UISupportedInterfaceOrientations": [
+          "UIInterfaceOrientationPortrait",
+          "UIInterfaceOrientationPortraitUpsideDown",
+          "UIInterfaceOrientationLandscapeLeft",
+          "UIInterfaceOrientationLandscapeRight"
+        ]
+      }
+    },
+    "web": {
+      "bundler": "metro"
+    },
+    "plugins": [
+      "@react-native-community/datetimepicker"
+    ]
+  }
+}

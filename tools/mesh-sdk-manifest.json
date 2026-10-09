@@ -1,0 +1,29 @@
+{
+  "ios_archive": {
+    "path": "ios/vendor/STBLEMesh/libST-BLE-Meshuniversal.a",
+    "sha256": "560e5900b5eec488fa3578910044bf5ff0b0d75719689ea57b5795d2b4ff6303"
+  },
+  "android_archive": {
+    "path": "android/app/libs/mesh-release.aar",
+    "sha256": "872177b1ed398d9649f2c6491699d616d49ed30248eb7404a971e8497ee46e59"
+  },
+  "ios_headers": {
+    "NSDataNSStringConversion.h": "728c6ef8286a5b5aa847b23436e548f33ea7660df6a9331bd7d4d855c618e63b",
+    "STMeshGenericModel.h": "085959a01412e37d1e2503c3200acdfa4b2ff88df0f304c5bb61043fb74f1e20",
+    "STMeshConfigurationModel.h": "50e9be63472138d0c45165b665ea89f1fe48812d735a77e5c09d119800b0cad0",
+    "STMeshBasicTypes.h": "04f31f00775bb873f6a63ec743bc72d84601853b44f9d494454acbface66649a",
+    "STMeshSensorModel.h": "eb648689c3e90c74bf5c3d3e2e95c139a065598163aa3864e8cfe02ffdf5c9c9",
+    "STMeshProvisioner.h": "e42aa1c77c620c167001271ecf7630566f63ac921186df9cb9f440a1fcc7e461",
+    "STMeshHeartbeatModel.h": "5a39b4ae410b03b637254b4414d842460efb12768b559c1eb85e15fb6b344889",
+    "STMeshVendorModel.h": "785528c1c451603ab6e6926a671db6ae17960c425ce2d36db12e7f3f28cf7f28",
+    "BlueNRG_Mesh.h": "dd47c610c87a8340fa33cf91f6ad92332bf29051eafe4236d37245a2a42c990d",
+    "STMeshTimeAndSceneModel.h": "d21b392860a20508eafce8ff53b4bdfdda1ae0fcb5c220860779c36eb7c15935",
+    "STMeshHealthModel.h": "c528c5d5190af097f6cda6a765b9b17aad1471afb8fad8148f81ed853c89701d",
+    "STMeshLightingModel.h": "750e3c1351b823e0dfe55dc7790dad0249021c732964a9b156b3179e1f70cdf3",
+    "STMeshManager.h": "1f20dc95a80411028150a0872d45b3d7e94f56513a96e4f736b194b6a9386ee4",
+    "STMeshHeartbeatControlModel.h": "8f2cf11b2b63da6a0a2d3ce4479c47f0a5bcdd1e753414aa777d128b520ae872",
+    "STMeshCompositionDataModel.h": "da81ca8e8939cae6a7d6a8515dd7743fc0c6570d4ee94cf50960997027d92fc0",
+    "STMeshLogger.h": "861e2d5eec5e7dbf16e6065a9fb4debcdc72385cfac6e114f5bb3bbb45497357",
+    "STMeshTypes.h": "0cb75e1e27115a77471776e81fc11b3ef54785b0d2656f3746220bcef4225fb4"
+  }
+}

@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 58" role="img" aria-labelledby="title desc">
+  <title id="title">Arcstore logo</title>
+  <desc id="desc">A compact ARC mark with nested green and purple arches.</desc>
+  <path
+    d="M12 53V30.8C12 18.9 20.7 9.2 32 9.2s20 9.7 20 21.6V53l-7.4-2.2v-20c0-7.9-5.4-14-12.6-14s-12.6 6.1-12.6 14v20L12 53Z"
+    fill="#31584a"
+    fill-rule="evenodd"
+  />
+  <path
+    d="M19.4 50.8v-20c0-7.9 5.4-14 12.6-14s12.6 6.1 12.6 14v20l-7.4-2.2V30.8c0-3.7-2.2-6.6-5.2-6.6s-5.2 2.9-5.2 6.6v17.8l-8 2.2Z"
+    fill="#4f378b"
+    fill-rule="evenodd"
+  />
+</svg>
