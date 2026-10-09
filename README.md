@@ -28,9 +28,7 @@ These are source capabilities. Availability depends on the device firmware, loca
 
 **iOS:** ARC's primary hardware-tested development platform. We have a TestFlight experience for interested collaborators and investors. This candidate passed an unsigned native iOS device build; signing, fresh on-device validation, and release decisions remain separate. See [validation](docs/validation.md).
 
-**Android:** The shared application and existing Kotlin/native project are preserved. An Android build-and-launch experiment is the next milestone; production readiness and current hardware functionality are not established. See [Android readiness](docs/android-readiness.md).
-
-A custom native development build is required; Expo Go does not contain ARC's native modules. The dark and light screenshots above illustrate ARC's main-view design; platform behavior depends on the tested build and connected hardware. See the [visual asset plan](assets/README.md).
+**Android:** The ARC React Native application has been successfully built and launched on Android 14, with native Kotlin BLE integration and hardware communication tested on a Samsung Galaxy Tab A8. The shared application now runs on both iOS and Android, including device discovery, live Lamp telemetry, lighting controls, and the graphical interface. Automated regression tests pass (111/111). Further validation and refinement remain necessary before production release. See the [visual asset plan](assets/README.md).
 
 ## Architecture
 
