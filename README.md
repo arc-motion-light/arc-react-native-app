@@ -6,7 +6,13 @@ ARC App brings intelligent lighting, environmental sensing, and connected physic
 
 This repository contains the actual React Native implementation: shared TypeScript, native iOS and Android projects, protocol clients, and tests. Through ARC Open Development, we invite technical exploration and collaboration.
 
-![ARC App architecture: people interact through the app with ARC hardware and permitted cloud data](assets/app-architecture.svg)
+### ARC app · Dark and light
+
+<p align="center">
+  <img src="assets/MainViewDark_1.PNG" alt="ARC App main view in dark mode" width="45%" />
+  &nbsp;
+  <img src="assets/MainViewLight_1.PNG" alt="ARC App main view in light mode" width="45%" />
+</p>
 
 ## What is implemented
 
@@ -24,7 +30,7 @@ These are source capabilities. Availability depends on the device firmware, loca
 
 **Android:** The shared application and existing Kotlin/native project are preserved. An Android build-and-launch experiment is the next milestone; production readiness and current hardware functionality are not established. See [Android readiness](docs/android-readiness.md).
 
-A custom native development build is required; Expo Go does not contain ARC's native modules. Existing UX/UI screenshots need review against the current build, so the diagram above explains the architecture without presenting old screens as current. See the [visual asset plan](assets/README.md).
+A custom native development build is required; Expo Go does not contain ARC's native modules. The dark and light screenshots above illustrate ARC's main-view design; platform behavior depends on the tested build and connected hardware. See the [visual asset plan](assets/README.md).
 
 ## Architecture
 
