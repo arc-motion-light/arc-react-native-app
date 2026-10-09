@@ -41,6 +41,8 @@ import {
   buildArcRegistryFromNodes,
   getPreferredArcAppLink,
 } from './src/arc/arcRoles';
+import { arcAdvertisementRole, isArcScanCandidate, isCurrentArcLamp, isLegacyMeshNode } from './src/arc/arcDeviceAdmission';
+import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { ArcDeviceRegistryEntry } from './src/arc/arcRoles';
 import { loadArcDeviceRegistry, saveArcDeviceRegistry } from './src/arc/arcRegistryStorage';
 import { createMeshComms } from './src/mesh';
@@ -52,7 +54,6 @@ import type { ArcGatewayDebugStatus, ArcProbeGatewayChildConfirmation, HistoryIn
 import type {
   MeshNode,
   MeshNodeKind,
-  MeshProvisioningCapabilities,
   MeshScanResult,
   ProbeSensorStatus,
 } from './src/mesh/meshTypes';
@@ -92,8 +93,10 @@ import {
 } from './src/cloud/arcCloud';
 import type { ArcAccountProfile, ArcChildAccountDraft, ArcCloudSession } from './src/cloud/arcCloud';
 import { HistoryRequestPhase, acceptHistorySequence, planHistoryRecovery, resolveHistoryRecovery } from './src/mesh/arcHistorySession';
+import { registeredProbeForHistoryIndex, canRetryBlockedProbeHistory, type BlockedProbeHistory } from './src/mesh/arcHistoryIdentity';
 import { historyDevice, prepareHistoryUpload, mergeHistoryRecords } from './src/cloud/historyGateway';
 import { canonicalDeviceNodes, canonicalDeviceForNode, deviceView, scheduleRing, mergePortalInventory } from './src/cloud/deviceView';
+import { applyOwnerConfirmedDeviceLinks, linkedHistoryInventory, ownerLinkKey, ownerLinkTargets, validatedOwnerLinkId, type OwnerConfirmedDeviceLinks } from './src/cloud/ownerConfirmedDeviceLinks';
 import { portalHistoryToLampLogs } from './src/cloud/portalTelemetry';
 import { portalClient, PortalApiError } from './src/cloud/portalClient';
 import { PortalPeoplePicker } from './src/cloud/PortalPeoplePicker';
@@ -438,7 +441,29 @@ const ConnectionsIcon = ({ size, color }: { size: number; color: string }) => (
 
 
 
+// Draw Graph View selection ticks as vectors: Android font baselines can move a
+// text "✓" below the center of a small checkbox.
+const GraphCheckboxTick = ({ color, size = 14 }: { color: string; size?: number }) => (
+  <Svg width={size} height={size} viewBox="0 0 16 16" accessibilityElementsHidden>
+    <SvgPath
+      d="M2.8 8.2 L6.25 11.55 L13.2 4.45"
+      stroke={color}
+      strokeWidth={2.2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      fill="none"
+    />
+  </Svg>
+);
+
 export default function App() {
+  return <SafeAreaProvider><ArcApp /></SafeAreaProvider>;
+}
+
+function ArcApp() {
+  const systemInsets = useSafeAreaInsets();
+  const [graphViewport, setGraphViewport] = useState({ width: 0, height: 0 });
+  const [graphMeasuredPlotHeight, setGraphMeasuredPlotHeight] = useState(0);
   const systemColorScheme = useColorScheme();
   const [themePreference, setThemePreference] = useState<AppThemePreference>('system');
   const [themePreferenceReady, setThemePreferenceReady] = useState(false);
@@ -465,7 +490,6 @@ export default function App() {
   const PENDING_WRITE_TIMEOUT_MS = 5000;
   const TIME_SYNC_COOLDOWN_MS = 60000;
   const TIME_SYNC_RETRY_BACKOFF_MS = 15000;
-  const DEFAULT_OOB_HEX = '112233445566778899aabbccddeeff00';
   const [activeTab, setActiveTab] = useState<TabKey>('home');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [languagePickerOpen, setLanguagePickerOpen] = useState(false);
@@ -748,19 +772,9 @@ export default function App() {
   const [meshEditName, setMeshEditName] = useState('');
   const [meshEditAbbrev, setMeshEditAbbrev] = useState('');
   const [meshEditColor, setMeshEditColor] = useState('#22c55e');
-  const [meshEditOobKey, setMeshEditOobKey] = useState('');
   const [meshEditError, setMeshEditError] = useState('');
   const selectedMeshNodeIdRef = useRef<string | null>(null);
   const selectedLampIdRef = useRef<string | null>(null);
-  const [meshDefaultOobKey, setMeshDefaultOobKey] = useState(DEFAULT_OOB_HEX);
-  const [meshIdentifyStateById, setMeshIdentifyStateById] = useState<Record<string, 'idle' | 'identifying' | 'identified' | 'failed'>>({});
-  const [meshCapabilitiesById, setMeshCapabilitiesById] = useState<
-    Record<string, MeshProvisioningCapabilities | null>
-  >({});
-  const [meshProvisionProgressById, setMeshProvisionProgressById] = useState<Record<string, string[]>>({});
-  const [meshCapabilitiesModalId, setMeshCapabilitiesModalId] = useState<string | null>(null);
-  const [meshConfirmOob, setMeshConfirmOob] = useState(false);
-  const [meshProvisionError, setMeshProvisionError] = useState<string | null>(null);
   const [probeGraphDrawerOpen, setProbeGraphDrawerOpen] = useState(false);
   const [probeSettingsOpen, setProbeSettingsOpen] = useState(false);
   const [probeAdvancedSamplingOpen, setProbeAdvancedSamplingOpen] = useState(false);
@@ -802,6 +816,12 @@ export default function App() {
   const [connectionsSectionReady, setConnectionsSectionReady] = useState(false);
   const [cloudLampLogs, setCloudLampLogs] = useState<LampOperationalRecord[]>([]);
   const [portalDevices, setPortalDevices] = useState<PortalDeviceSummary[]>([]);
+  const [ownerLinkPickerOpen, setOwnerLinkPickerOpen] = useState(false);
+  const [ownerLinkSaving, setOwnerLinkSaving] = useState(false);
+  const autoReconnectAttemptedRef = useRef(new Set<string>());
+  const [ownerLinkTargetId, setOwnerLinkTargetId] = useState<string | null>(null);
+  const [ownerConfirmedLinks, setOwnerConfirmedLinks] = useState<OwnerConfirmedDeviceLinks>({});
+  const [ownerLinksAccount, setOwnerLinksAccount] = useState<string | null>(null);
   const [portalDevicesCachedAt, setPortalDevicesCachedAt] = useState<number | null>(null);
   const [portalInventoryCached, setPortalInventoryCached] = useState(false);
   const portalInventorySourceRef = useRef<'none' | 'cache' | 'network'>('none');
@@ -1039,21 +1059,110 @@ export default function App() {
 
   const selectedDevice = devices.find((device) => device.id === selectedDeviceId);
   const selectedDeviceName = selectedDevice?.name || selectedDevice?.localName || 'Lamp';
-  const selectedMeshNode = meshNodes.find((node) => node.id === meshSelectedNodeId);
+  const selectedMeshNode = meshNodes.find((node) => node.id === meshSelectedNodeId && !isLegacyMeshNode(node));
   const historySyncPolicyRef = useRef({ enabled: cloudSyncEnabled, ready: cloudSyncPreferenceReady });
   historySyncPolicyRef.current = { enabled: cloudSyncEnabled, ready: cloudSyncPreferenceReady };
   const historyAccessUserRef = useRef<string | null>(null);
   const historyInventoryRef = useRef<{ devices: PortalDeviceSummary[]; userId: string | null }>({ devices: [], userId: null });
-  historyInventoryRef.current = { devices: portalDevices, userId: historyAccessUserRef.current };
   const knownCanonicalDeviceIdsRef = useRef(new Set<string>());
   portalDevices.forEach(device => {
     knownCanonicalDeviceIdsRef.current.add(device.id);
     device.telemetrySourceNodeIds?.forEach(id => knownCanonicalDeviceIdsRef.current.add(id));
   });
+  // Platform BLE IDs are connection endpoints, not cloud device identities.
+  // Associations are explicit, owner-confirmed and revalidated on every render.
+  useEffect(() => {
+    const uid = arcCloudSession.userId;
+    setOwnerConfirmedLinks({});
+    setOwnerLinksAccount(null);
+    autoReconnectAttemptedRef.current.clear();
+    setOwnerLinkPickerOpen(false);
+    setOwnerLinkTargetId(null);
+    if (Platform.OS !== 'android' || !uid) return;
+    let cancelled = false;
+    void AsyncStorage.getItem(`arc:owner-device-links:${uid}`).then(value => {
+      if (cancelled) return;
+      let safe: OwnerConfirmedDeviceLinks = {};
+      try {
+        const parsed: unknown = value ? JSON.parse(value) : {};
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          safe = Object.fromEntries(Object.entries(parsed).filter(([key, id]) =>
+            /^(lamp|probe):[0-9A-F]{12}$/.test(key) && typeof id === 'string' && id.length > 0));
+        }
+      } catch { /* Invalid prior local mapping is discarded, never trusted. */ }
+      setOwnerConfirmedLinks(safe);
+      setOwnerLinksAccount(uid);
+    }).catch(() => { if (!cancelled) setOwnerLinksAccount(uid); });
+    return () => { cancelled = true; };
+  }, [arcCloudSession.userId]);
+  const activeOwnerLinks = useMemo(() =>
+    ownerLinksAccount === arcCloudSession.userId && !portalInventoryCached ? ownerConfirmedLinks : {},
+    [ownerLinksAccount, arcCloudSession.userId, ownerConfirmedLinks, portalInventoryCached]);
+  // Treat the BLE MAC as a transport alias only after explicit owner selection.
+  // The projection is local: it does not grant permissions or modify Firestore.
+  const resolvedHistoryInventory = useMemo(() => linkedHistoryInventory(
+    meshNodes, portalDevices, activeOwnerLinks, arcCloudSession.userId,
+  ), [meshNodes, portalDevices, activeOwnerLinks, arcCloudSession.userId]);
+  historyInventoryRef.current = { devices: resolvedHistoryInventory, userId: historyAccessUserRef.current };
+
+  const ownerLinkSource = meshNodes.find(node => node.id === meshEditNodeId) ?? null;
+  const canConnectLocalNode = (node: MeshNode) => {
+    if (Platform.OS !== 'android' || (node.nodeKind !== 'lamp' && node.nodeKind !== 'probe')) return true;
+    return Boolean(arcCloudSession.userId && ownerLinksAccount === arcCloudSession.userId &&
+      !portalInventoryCached && validatedOwnerLinkId(node, portalDevices, activeOwnerLinks, arcCloudSession.userId));
+  };
+
+  const ownerLinkCandidates = ownerLinkSource && ownerLinksAccount === arcCloudSession.userId && !portalInventoryCached
+    ? ownerLinkTargets(ownerLinkSource, portalDevices, arcCloudSession.userId).filter(device =>
+        !Object.entries(activeOwnerLinks).some(([key, target]) =>
+          target === device.id && key !== ownerLinkKey(ownerLinkSource))) : [];
+  const ownerLinkExistingTarget = ownerLinkSource ? activeOwnerLinks[ownerLinkKey(ownerLinkSource)] ?? null : null;
+  const saveOwnerLink = async (target: string | null): Promise<boolean> => {
+    const uid = arcCloudSession.userId;
+    const node = ownerLinkSource;
+    if (!uid || !node || ownerLinksAccount !== uid || currentCloudUserRef.current !== uid || portalInventoryCached) {
+      setMeshEditError('Refresh your ARC account and device inventory before changing the association.');
+      return false;
+    }
+    const key = ownerLinkKey(node);
+    if (target && !ownerLinkCandidates.some(device => device.id === target)) {
+      setMeshEditError('Select an owned, unassigned ARC device of the matching type.');
+      return false;
+    }
+    const next: OwnerConfirmedDeviceLinks = { ...activeOwnerLinks };
+    if (target) next[key] = target;
+    else delete next[key];
+    if (target && validatedOwnerLinkId(node, portalDevices, next, uid) !== target) {
+      setMeshEditError('This association conflicts with an existing BLE/cloud device identity.');
+      return false;
+    }
+    setOwnerLinkSaving(true);
+    try {
+      // Removing/changing a mapping must not leave a previously connected BLE
+      // transport operating under an obsolete cloud identity.
+      if (node.connected && activeOwnerLinks[key] !== target) {
+        await mesh.disconnectNode(node.id);
+        setMeshNodes(prev => prev.map(n => n.id === node.id ? { ...n, connected: false } : n));
+      }
+      await AsyncStorage.setItem(`arc:owner-device-links:${uid}`, JSON.stringify(next));
+      if (currentCloudUserRef.current !== uid) return false;
+      setOwnerConfirmedLinks(next);
+      setOwnerLinkTargetId(target);
+      setOwnerLinkPickerOpen(false);
+      console.log(`[ArcIdentity][LOCAL_LINK] kind=${node.nodeKind} mac=${node.id} canonical=${target ?? 'unlinked'}`);
+      return true;
+    } catch {
+      setMeshEditError('Could not save the local association. No cloud records were changed.');
+      return false;
+    } finally {
+      setOwnerLinkSaving(false);
+    }
+  };
+
   const localLampNodes = useMemo(
     () =>
       meshNodes
-        .filter((node) => node.nodeKind === 'lamp')
+        .filter(isCurrentArcLamp)
         .sort((a, b) => {
           if (a.connected !== b.connected) return a.connected ? -1 : 1;
           if (a.provisioned !== b.provisioned) return a.provisioned ? -1 : 1;
@@ -1061,9 +1170,16 @@ export default function App() {
         }),
     [meshNodes]
   );
-  const lampNodes = useMemo(() => canonicalDeviceNodes(localLampNodes, portalDevices, 'lamp', knownCanonicalDeviceIdsRef.current), [localLampNodes, portalDevices]);
+  const lampNodes = useMemo(() => canonicalDeviceNodes(applyOwnerConfirmedDeviceLinks(localLampNodes, portalDevices, activeOwnerLinks, arcCloudSession.userId), portalDevices, 'lamp', knownCanonicalDeviceIdsRef.current), [localLampNodes, portalDevices, activeOwnerLinks, arcCloudSession.userId]);
   const selectedLampNode = lampNodes.find((node) => node.id === selectedLampId) ?? null;
   const selectedLampName = selectedLampNode?.name ?? t('lamp.noSelected');
+  // A local BLE MAC and a cloud UUID may have the same human-readable name
+  // without having a verified identity mapping. Never fuse them by name.
+  const graphDeviceLabel = (node: { id: string; name: string; blePeripheralId?: string | null; canonicalDeviceId?: string }) => {
+    const kind = node.blePeripheralId ? 'BLE' : node.canonicalDeviceId ? 'Cloud' : 'Local';
+    const shortId = node.id.length > 12 ? node.id.slice(-8) : node.id;
+    return `${node.name} · ${kind} (${shortId})`;
+  };
   const selectedLanguageLabel =
     languagePreference === 'system'
       ? t('common.systemDefault')
@@ -1071,14 +1187,14 @@ export default function App() {
   const mainProbeLabel = t('probe.title');
   const mainDataLabel = t('home.dataShort');
   const arcRegistry = useMemo(() => {
-    const derived = buildArcRegistryFromNodes(meshNodes);
-    return derived.length ? derived : arcRegistrySeed;
+    const derived = buildArcRegistryFromNodes(meshNodes.filter(node => !isLegacyMeshNode(node)));
+    return derived.length ? derived : arcRegistrySeed.filter(entry => !meshNodes.some(node => node.id === entry.id && isLegacyMeshNode(node)));
   }, [arcRegistrySeed, meshNodes]);
   const selectedArcAppLink = useMemo(() => getPreferredArcAppLink(arcRegistry), [arcRegistry]);
   const provisionedProbeNodes = useMemo(
     () =>
       meshNodes
-        .filter((node) => node.nodeKind === 'probe' && node.provisioned)
+        .filter((node) => node.nodeKind === 'probe' && node.provisioned && !isLegacyMeshNode(node))
         .sort((a, b) => {
           if (a.connected !== b.connected) return a.connected ? -1 : 1;
           return a.name.localeCompare(b.name);
@@ -1087,7 +1203,7 @@ export default function App() {
   );
   // Probe identity comes only from real provisioned Probe nodes.
   // Cloud is a replication/data source for a Probe, not a second synthetic Probe identity.
-  const selectableProbeNodes = useMemo(() => canonicalDeviceNodes(provisionedProbeNodes, portalDevices, 'probe', knownCanonicalDeviceIdsRef.current), [provisionedProbeNodes, portalDevices]);
+  const selectableProbeNodes = useMemo(() => canonicalDeviceNodes(applyOwnerConfirmedDeviceLinks(provisionedProbeNodes, portalDevices, activeOwnerLinks, arcCloudSession.userId), portalDevices, 'probe', knownCanonicalDeviceIdsRef.current), [provisionedProbeNodes, portalDevices, activeOwnerLinks, arcCloudSession.userId]);
   const selectedProbeNode = useMemo(() => {
     const requestedId = selectedPortalProbeId ?? selectedProbeSourceId;
     if (requestedId) {
@@ -1112,11 +1228,11 @@ export default function App() {
     [portalDevices]
   );
   const portalLatestProbeDevices = useMemo(
-    () => portalProbeDevices.filter(device => canOpenLatest(device) && !selectableProbeNodes.some(node => node.id === device.id)),
+    () => portalProbeDevices.filter(device => canOpenLatest(device) && !selectableProbeNodes.some(node => node.id === device.id || node.canonicalDeviceId === device.id)),
     [portalProbeDevices, selectableProbeNodes]
   );
   const portalHistoryProbeDevices = useMemo(
-    () => portalProbeDevices.filter(device => canOpenHistory(device) && !selectableProbeNodes.some(node => node.id === device.id)),
+    () => portalProbeDevices.filter(device => canOpenHistory(device) && !selectableProbeNodes.some(node => node.id === device.id || node.canonicalDeviceId === device.id)),
     [portalProbeDevices, selectableProbeNodes]
   );
   const selectedPortalProbe = useMemo(
@@ -1129,9 +1245,14 @@ export default function App() {
   const selectedProbeView = deviceView(selectedProbeNode, portalDevices, !portalInventoryCached, knownCanonicalDeviceIdsRef.current);
   const selectedProbeLiveStatus = selectedProbeView.probeStatus;
   const selectedProbeSettingsReady = selectedProbeNode ? Boolean(probeSettingsReadyById[selectedProbeNode.id]) : false;
-  const selectedProbeSettings = selectedProbeNode
-    ? probeSettingsById[selectedProbeNode.id] ?? (selectedProbeSettingsReady ? buildDefaultProbeSettings(selectedProbeNode.id, selectedProbeNode.name) : null)
-    : null;
+  // Do not allocate a new fallback settings object on every render. An unstable
+  // effect dependency used to write a fresh logging-settings object each time,
+  // which can trigger React's maximum-update-depth guard on Graph opening.
+  const selectedProbeSettings = useMemo(() => {
+    if (!selectedProbeNode) return null;
+    return probeSettingsById[selectedProbeNode.id] ??
+      (selectedProbeSettingsReady ? buildDefaultProbeSettings(selectedProbeNode.id, selectedProbeNode.name) : null);
+  }, [selectedProbeNode?.id, selectedProbeNode?.name, selectedProbeSettingsReady, probeSettingsById]);
   const activeConnected = meshEnabled ? Boolean(selectedLampNode?.connected) : connected;
   const selectedLampView = deviceView(selectedLampNode, portalDevices, !portalInventoryCached, knownCanonicalDeviceIdsRef.current);
   const localConfirmedSchedule = selectedLampNode ? meshLocalConfigByNodeRef.current[selectedLampNode.id] : null;
@@ -1460,45 +1581,11 @@ export default function App() {
     { title: t('graph.groupLampThermal'), signals: ['lampCoreTemp', 'lampBoardTemp'] },
     { title: t('graph.groupLampOperation'), signals: ['lampPower', 'lampFan1', 'lampFan2', 'lampOutput'] },
   ];
-  const getMeshNodeKindLabel = (kind?: MeshNodeKind | null) => meshNodeKindLabels[kind ?? 'lamp'];
+  const getMeshNodeKindLabel = (kind?: MeshNodeKind | null) => meshNodeKindLabels[kind ?? 'other'];
 
-  const inferMeshNodeKind = (name?: string | null): MeshNodeKind => {
-    const normalized = String(name ?? '').toLowerCase();
-    if (normalized.includes('probe') || normalized.includes('sensor')) return 'probe';
-    if (normalized.includes('gateway') || normalized.includes('gate')) return 'gateway';
-    if (normalized.includes('remote')) return 'remote';
-    return 'lamp';
-  };
+  const inferMeshNodeKind = arcAdvertisementRole;
 
   const defaultMeshNameForKind = (kind: MeshNodeKind) => meshNodeKindLabels[kind] ?? t('node.generic');
-
-  const normalizeOobHex = (value: string) => value.replace(/[^0-9a-fA-F]/g, '').toLowerCase();
-  const maskOobHex = (value: string) =>
-    value.length <= 8 ? value : `${value.slice(0, 4)}...${value.slice(-4)}`;
-  const getNodeOobKey = (node: MeshNode | null) => {
-    const raw = (node?.staticOobHex || meshDefaultOobKey || '').trim();
-    return normalizeOobHex(raw);
-  };
-
-  const provisioningStateLabels: Record<string, string> = {
-    PROVISIONING_INVITE: 'Sending commissioning invite...',
-    PROVISIONING_CAPABILITIES: 'Commissioning capabilities received...',
-    PROVISIONING_START: 'Starting commissioning...',
-    PROVISIONING_PUBLIC_KEY_SENT: 'Sending commissioning public key...',
-    PROVISIONING_PUBLIC_KEY_RECEIVED: 'Commissioning public key received...',
-    PROVISIONING_AUTHENTICATION_STATIC_OOB_WAITING: 'Waiting for static OOB input...',
-    PROVISIONING_AUTHENTICATION_OUTPUT_OOB_WAITING: 'Waiting for output OOB input...',
-    PROVISIONING_AUTHENTICATION_INPUT_OOB_WAITING: 'Waiting for input OOB input...',
-    PROVISIONING_AUTHENTICATION_INPUT_ENTERED: 'OOB authentication entered...',
-    PROVISIONING_INPUT_COMPLETE: 'Commissioning input complete received...',
-    PROVISIONING_CONFIRMATION_SENT: 'Sending commissioning confirmation...',
-    PROVISIONING_CONFIRMATION_RECEIVED: 'Commissioning confirmation received...',
-    PROVISIONING_RANDOM_SENT: 'Sending commissioning random...',
-    PROVISIONING_RANDOM_RECEIVED: 'Commissioning random received...',
-    PROVISIONING_DATA_SENT: 'Sending commissioning data...',
-    PROVISIONING_COMPLETE: 'Commissioning complete received...',
-    PROVISIONING_FAILED: 'Commissioning failed received...',
-  };
 
   const buildMeshAbbrev = (name: string) => {
     const cleaned = name.trim();
@@ -1528,10 +1615,10 @@ export default function App() {
       const existing = new Map(prev.map((node) => [node.id, node]));
       const usedNames = new Set(prev.filter((node) => node.provisioned).map((node) => node.name.trim().toLowerCase()));
       const nextNodes: MeshNode[] = [];
-      scanned.forEach((result, index) => {
+      scanned.filter(isArcScanCandidate).forEach((result, index) => {
         const found = existing.get(result.id);
         const advertisedName = result.localName ?? result.name ?? result.cachedName ?? null;
-        const nodeKind = found?.nodeKind ?? inferMeshNodeKind(advertisedName);
+        const nodeKind = found?.nodeKind ?? (result.arcPreviouslyValidated ? result.nodeKind : undefined) ?? inferMeshNodeKind(advertisedName);
         let displayName = found?.provisioned ? found.name : advertisedName ?? found?.name ?? defaultMeshNameForKind(nodeKind);
         let candidate = displayName.trim() || defaultMeshNameForKind(nodeKind);
         let suffix = 1;
@@ -1554,7 +1641,10 @@ export default function App() {
           name: displayName,
           abbreviation,
           color,
-          provisioned: found?.provisioned ?? Boolean(result.arcLocalRoleAdvertised),
+          // Native Android scanner supplies a BLE MAC, not a cloud claim.
+          // This flag only describes a locally addressable transport node.
+          provisioned: Platform.OS === 'android' ? true : found?.provisioned ?? false,
+          blePeripheralId: result.blePeripheralId ?? found?.blePeripheralId ?? (Platform.OS === 'android' ? result.id : null),
           connected: false,
           staticOobHex: found?.staticOobHex ?? null,
           status: found?.status ?? null,
@@ -1580,7 +1670,7 @@ export default function App() {
   const mergeProvisionedMeshNodes = (provisioned: MeshNode[]) => {
     setMeshNodes((prev) => {
       const byId = new Map(prev.map((node) => [node.id, node]));
-      const merged = provisioned.map((nextNode, index) => {
+      const merged = provisioned.filter(node => !isLegacyMeshNode(node)).map((nextNode, index) => {
         const existing = byId.get(nextNode.id);
         const name = existing?.name ?? buildUniqueMeshName(nextNode.name || 'Lamp', prev);
         const abbreviation = existing?.abbreviation ?? buildMeshAbbrev(name);
@@ -2335,13 +2425,13 @@ export default function App() {
         if (recoveredCount) console.log(`[ProbeCache][RESTORE] recovered=${recoveredCount}`);
         setMeshNodes(restored);
         setArcRegistrySeed(storedArcRegistry);
-        const storedLamps = restored.filter((node) => node.nodeKind === 'lamp');
+        const storedLamps = restored.filter(isCurrentArcLamp);
         const restoredLamp = storedLamps.find((node) => node.id === storedLampId) ?? storedLamps[0] ?? null;
         setSelectedLampId(restoredLamp?.id ?? null);
         setLampSelectionReady(true);
         setMeshPersistenceReady(true);
-        if (!meshSelectedNodeId && stored.length) {
-          setMeshSelectedNodeId(stored[0].id);
+        if (!meshSelectedNodeId) {
+          setMeshSelectedNodeId(restored.find(node => !isLegacyMeshNode(node))?.id ?? null);
         }
       }
     };
@@ -2358,8 +2448,10 @@ export default function App() {
 
   useEffect(() => {
     if (!meshPersistenceReady) return;
-    void saveArcDeviceRegistry(arcRegistry);
-  }, [arcRegistry, meshPersistenceReady]);
+    const durable = new Map(arcRegistrySeed.map(entry => [entry.id, entry]));
+    arcRegistry.forEach(entry => durable.set(entry.id, entry));
+    void saveArcDeviceRegistry([...durable.values()]);
+  }, [arcRegistry, arcRegistrySeed, meshPersistenceReady]);
 
   useEffect(() => {
     if (!schedulePersistenceReady || !meshEnabled || !selectedLampNode?.id) return;
@@ -2383,7 +2475,7 @@ export default function App() {
     const mergeNodes = (incoming: MeshNode[]) => {
       setMeshNodes((prev) => {
         const byId = new Map(prev.map((node) => [node.id, node]));
-        const merged = incoming.map((node) => {
+        const merged = incoming.filter(node => !isLegacyMeshNode(node)).map((node) => {
           const existing = byId.get(node.id);
           return {
             ...node,
@@ -2437,17 +2529,12 @@ export default function App() {
           }))
         );
         const preferredLamp = meshNodesRef.current.find(
-          (node) => node.id === selectedLampIdRef.current && node.nodeKind === 'lamp'
-        ) ?? meshNodesRef.current.find((node) => node.nodeKind === 'lamp' && node.provisioned) ?? null;
-        if (preferredLamp) {
+          (node) => node.id === selectedLampIdRef.current && isCurrentArcLamp(node)
+        ) ?? meshNodesRef.current.find(isCurrentArcLamp) ?? null;
+        if (preferredLamp && Platform.OS !== 'android') {
           setMeshStatus(`Reconnecting ${preferredLamp.name} locally...`);
           await mesh.connectNode(preferredLamp.id);
         }
-        // Bluetooth Mesh proxy startup is useful when present, but must not
-        // block the direct local Lamp/FRAM path on installations without one.
-        void mesh.connectAll().catch((error: any) =>
-          addMeshLog(`Mesh proxy unavailable; local Lamp link remains active: ${error?.message ?? String(error)}`, preferredLamp?.id)
-        );
         if (!cancelled) {
           setMeshTransportReady(true);
           setMeshStatus('ARC transport ready');
@@ -2463,9 +2550,32 @@ export default function App() {
 
     return () => {
       cancelled = true;
-      mesh.disconnectAll().catch(() => undefined);
+      meshNodesRef.current.filter(node => !isLegacyMeshNode(node)).forEach(node => {
+        void mesh.disconnectNode(node.id).catch(() => undefined);
+      });
     };
   }, [mesh, meshEnabled, meshPersistenceReady]);
+
+  // Native initialization must NOT connect an unassociated BLE MAC. After
+  // transport, owner-linked aliases and fresh grants are ready, reconnect one
+  // previously saved Lamp exactly once per app session. Manual disconnect stays
+  // manual; a later app launch retries automatically.
+  useEffect(() => {
+    if (Platform.OS !== 'android' || !meshEnabled || !mesh.isAvailable || !meshTransportReady ||
+        !arcCloudSession.userId || ownerLinksAccount !== arcCloudSession.userId || portalInventoryCached) return;
+    const candidates = meshNodes.filter(node => isCurrentArcLamp(node) && !node.connected && canConnectLocalNode(node));
+    const selected = candidates.find(node => node.id === selectedLampId) ?? candidates[0];
+    if (!selected) return;
+    const key = `${arcCloudSession.userId}:${ownerLinkKey(selected)}`;
+    if (autoReconnectAttemptedRef.current.has(key)) return;
+    autoReconnectAttemptedRef.current.add(key);
+    setMeshStatus(`Reconnecting previously associated ${selected.name}...`);
+    void mesh.connectNode(selected.id).catch(err => {
+      console.log(`[ArcIdentity][RECONNECT_FAIL] mac=${selected.id} error=${err?.message ?? String(err)}`);
+      setMeshStatus(`Auto reconnect failed: ${err?.message ?? String(err)}`);
+    });
+  }, [mesh, meshEnabled, meshTransportReady, meshNodes, selectedLampId,
+      arcCloudSession.userId, ownerLinksAccount, portalDevices, portalInventoryCached, activeOwnerLinks]);
 
   useEffect(() => {
     if (!meshEnabled || !mesh.isAvailable) return;
@@ -2577,6 +2687,8 @@ export default function App() {
             // A decoded frame is stronger evidence of a live app-facing link
             // than cached UI state or a missed CoreBluetooth connection event.
             connected: true,
+            provisioned: true,
+            blePeripheralId: node.blePeripheralId ?? node.id,
             lastKnownConnected: true,
             status: nextStatus,
             probeStatus,
@@ -2703,6 +2815,7 @@ export default function App() {
       const repairKey = `${pendingProbe.id}:${currentGateway.id}:policy0-thread-seen`;
       if (probeRouteRepairKeysRef.current.has(repairKey)) return;
 
+      if (Platform.OS === 'android' && (!canConnectLocalNode(pendingProbe) || !canConnectLocalNode(currentGateway))) return;
       probeRouteRepairKeysRef.current.add(repairKey);
       console.log(
         `[ProbeRoute][REPAIR][BEGIN] probe=${pendingProbe.id} gateway=${currentGateway.id} reason=${reason} seq=${sequence}`
@@ -2836,7 +2949,11 @@ export default function App() {
     const historyQueues = new Map<string, Promise<void>>();
     const historyRequestPhases = new Map<string, HistoryRequestPhase>();
     const productionHistoryLeases = new Map<string, number>();
+    // Hardware limits one request to 32 records. Do not add a 60-second delay
+    // between successful batches: stream successive bounded requests immediately.
     const HISTORY_BATCH_LIMIT = 32;
+    const HISTORY_PASS_RECORD_LIMIT = 256;
+    const historyIdentityBlocks = new Map<string, BlockedProbeHistory>();
     const historyDrains = new Map<string, {
       startedAt: number;
       requestedAfter: number;
@@ -2845,6 +2962,7 @@ export default function App() {
       batchThrough: number;
       userId: string;
       mappingCount: number;
+      probeIntervalSeconds: number;
       framOldest: number;
       cloudEnabled: boolean;
     }>();
@@ -2861,9 +2979,11 @@ export default function App() {
       cloudEnabled: boolean;
       userId: string;
       mappingCount: number;
+      probeIntervalSeconds: number;
     }>();
     const historyProbeBindings = new Map<string, Map<number, string>>();
     const historyStarts = new Map<string, string>();
+    const historyCloudEpochSuspects = new Map<string, { userId: string; cloudHead: number }>();
     const historyFreshStatusRetries = new Map<string, number>();
     const historySkipLoggedAt = new Map<string, number>();
     const logHistorySyncSkip = (lampId: string, reason: string) => {
@@ -2918,7 +3038,11 @@ export default function App() {
       if (callback && sourceGeneration !== undefined && callback.generation !== sourceGeneration) callback.oldPhase = true;
       queueHistoryWork(lampId, async () => {
         if (phase && callback && !phase.owns(callback)) {
-          addMeshLog(`[HistorySync][STALE] lamp=${lampId} seq=${record?.sequence ?? 'empty'} reason=old_phase`, lampId);
+          // Remaining records in an aborted batch were already in flight.
+          // Logging each one is noise, especially when an identity grant is
+          // blocking recovery. Keep other phase-isolation diagnostics intact.
+          if (!historyIdentityBlocks.has(lampId))
+            addMeshLog(`[HistorySync][STALE] lamp=${lampId} seq=${record?.sequence ?? 'empty'} reason=old_phase`, lampId);
           return;
         }
         await work();
@@ -3000,6 +3124,31 @@ export default function App() {
       if (!userId) { logHistorySyncSkip(lampId, 'no_signed_in_user'); return; }
       if (inventory.userId !== userId) { logHistorySyncSkip(lampId, 'inventory_user_not_ready'); return; }
       if (!device?.access.canViewHistory) { logHistorySyncSkip(lampId, 'lamp_history_access_missing'); return; }
+      const blocked = historyIdentityBlocks.get(lampId);
+      if (blocked) {
+        if (blocked.accountUid !== userId) historyIdentityBlocks.delete(lampId);
+        else {
+          const registered = registeredProbeForHistoryIndex(inventory.devices, lampId, blocked.probeIndex);
+          const witnessedId = historyProbeBindings.get(lampId)?.get(blocked.probeIndex) ?? null;
+          const witnessed = witnessedId ? historyDevice(inventory.devices, witnessedId, 'probe') : null;
+          const hint = routedHistoryHints.get(lampId);
+          const hintDevice = hint ? historyDevice(inventory.devices, hint.probeId, 'probe') : null;
+          if (!canRetryBlockedProbeHistory(blocked, {
+            accountUid: userId, now: Date.now(), registeredProbeId: registered?.id ?? null,
+            registeredHasHistoryGrant: Boolean(registered?.access.canViewHistory),
+            witnessedProbeId: witnessedId,
+            witnessHasHistoryGrant: Boolean(witnessed?.access.canViewHistory),
+            hintSeenAt: hint?.seenAt ?? null,
+            hintHasHistoryGrant: Boolean(hintDevice?.access.canViewHistory),
+          })) {
+            logHistorySyncSkip(lampId, `probe_index_${blocked.probeIndex}_awaiting_verified_identity`);
+            return;
+          }
+          // Keep the block until a valid binding is actually confirmed. A
+          // failed witness cannot fall through into another unverified batch.
+          if (hint && hint.seenAt > blocked.lastHintSeenAt) blocked.lastHintSeenAt = hint.seenAt;
+        }
+      }
       if (!historySubscriptionsActive) return;
       if (historyStarts.size || historyDrains.size || historyIdentityWitnesses.size) return;
       if (!historyOwner.tryProduction(lampId)) return;
@@ -3065,10 +3214,26 @@ export default function App() {
         addMeshLog(`[HistorySync][STATUS] lamp=${lampId} schema=${historyStatus.recordVersion} count=${historyStatus.count}/${historyStatus.capacity} oldest=${historyStatus.oldestSequence} newest=${historyStatus.newestSequence} ack=${historyStatus.acknowledgedSequence} cursor=${cursor} mappings=${historyStatus.mappingCount} probeCadence=${historyStatus.probeIntervalSeconds ?? 'legacy'} lampCadence=${historyStatus.lampFollowsProbe ? 'follow_probe' : historyStatus.lampIntervalSeconds ?? 'legacy'} ready=${historyStatus.ready ? 1 : 0}`, lampId);
         const cloudEnabled = historySyncPolicyRef.current.enabled;
         const canonical = historyDevice(inventory.devices, lampId, 'lamp');
-        const recovery = await resolveHistoryRecovery(historyStatus, local, cloudEnabled && Boolean(canonical), () =>
-          portalClient.historyCoverage(canonical!.id, historyStatus.oldestSequence, historyStatus.newestSequence), canonical?.id);
+        const epochSuspect = historyCloudEpochSuspects.get(lampId);
+        const avoidUnverifiedCloudCoverage = Boolean(epochSuspect && epochSuspect.userId === userId &&
+          epochSuspect.cloudHead > historyStatus.newestSequence);
+        const recovery = await resolveHistoryRecovery(historyStatus, local,
+          cloudEnabled && Boolean(canonical) && !avoidUnverifiedCloudCoverage,
+          () => portalClient.historyCoverage(canonical!.id, historyStatus.oldestSequence, historyStatus.newestSequence), canonical?.id);
         const { coverage, coverageError } = recovery;
         let plan = recovery.plan;
+        // An older Cloud history generation can have a head far beyond the
+        // current WBA journal after a deliberate sequence reset. It must never
+        // authorize a skip, and repeatedly refreshing STATUS cannot fix it.
+        if (coverage && coverage.newestSeen !== null &&
+            coverage.newestSeen > historyStatus.newestSequence + historyStatus.capacity) {
+          historyCloudEpochSuspects.set(lampId, { userId, cloudHead: coverage.newestSeen });
+          plan = planHistoryRecovery(historyStatus, cursor, local.ranges);
+          addMeshLog(`[HistorySync][CLOUD_EPOCH_UNVERIFIED] lamp=${lampId} cloudHead=${coverage.newestSeen} framHead=${historyStatus.newestSequence} action=local_only_recovery`, lampId);
+        } else if (epochSuspect && epochSuspect.userId === userId &&
+                   epochSuspect.cloudHead <= historyStatus.newestSequence) {
+          historyCloudEpochSuspects.delete(lampId);
+        }
         // A network outage permits conservative local reads. An explicit grant
         // rejection is newer authority and must not become an offline bypass.
         if (coverageError instanceof PortalApiError && coverageError.status === 403 && currentCloudUserRef.current === userId) {
@@ -3114,6 +3279,7 @@ export default function App() {
           ? [...(historyProbeBindings.get(lampId)?.values() ?? [])].includes(hint.probeId)
           : false;
         const hintDevice = hint ? historyDevice(inventory.devices, hint.probeId, 'probe') : null;
+        const blockedIndex = historyIdentityBlocks.get(lampId)?.probeIndex;
         const canWitnessIdentity = Boolean(
           historyStatus.mappingCount > 1 &&
           hint &&
@@ -3121,8 +3287,24 @@ export default function App() {
           assignedProbes.length === 1 &&
           assignedProbes[0].id === hint.probeId &&
           hintDevice?.access.canViewHistory &&
-          !alreadyBound
+          !alreadyBound &&
+          !(blockedIndex !== undefined &&
+            registeredProbeForHistoryIndex(inventory.devices, lampId, blockedIndex)?.access.canViewHistory)
         );
+        // A previously blocked index may not be silently bypassed by a regular
+        // recovery batch. Wait for an explicit backend index registration or a
+        // recent routed Probe witness to establish the binding.
+        if (blockedIndex !== undefined && !canWitnessIdentity) {
+          const registered = registeredProbeForHistoryIndex(inventory.devices, lampId, blockedIndex);
+          const boundId = historyProbeBindings.get(lampId)?.get(blockedIndex);
+          const bound = boundId ? historyDevice(inventory.devices, boundId, 'probe') : null;
+          if ((registered && boundId && registered.id !== (bound?.id ?? boundId)) ||
+              (!registered?.access.canViewHistory && !bound?.access.canViewHistory)) {
+            logHistorySyncSkip(lampId, `probe_index_${blockedIndex}_still_unresolved`);
+            return;
+          }
+          historyIdentityBlocks.delete(lampId);
+        }
         if (canWitnessIdentity && hint) {
           // Inspect only the tail of the captured FRAM window. G4/WBA have already
           // validated and persisted the record, so a nearby timestamped
@@ -3144,6 +3326,7 @@ export default function App() {
             drainAfter: range.after,
             userId,
             mappingCount: historyStatus.mappingCount,
+            probeIntervalSeconds: historyStatus.probeIntervalSeconds ?? 300,
           });
           addMeshLog(`[HistorySync][IDENTITY_WITNESS] lamp=${lampId} probe=${hint.probeId} after=${witnessAfter} head=${historyStatus.newestSequence} recoveryHead=${range.head}`, lampId);
           await requestHistoryChunk(lampId, witnessAfter);
@@ -3158,6 +3341,7 @@ export default function App() {
           batchThrough: range.after,
           userId,
           mappingCount: historyStatus.mappingCount,
+          probeIntervalSeconds: historyStatus.probeIntervalSeconds ?? 300,
           framOldest: historyStatus.oldestSequence,
           cloudEnabled,
         });
@@ -3203,6 +3387,8 @@ export default function App() {
             const bindings = historyProbeBindings.get(lampId) ?? new Map<number, string>();
             bindings.set(record.probeIndex, witness.probeId);
             historyProbeBindings.set(lampId, bindings);
+            if (historyIdentityBlocks.get(lampId)?.probeIndex === record.probeIndex)
+              historyIdentityBlocks.delete(lampId);
             addMeshLog(`[HistorySync][IDENTITY_BOUND] lamp=${lampId} probeIndex=${record.probeIndex} probe=${witness.probeId} seq=${record.sequence}`, lampId);
             stopHistoryDrain(lampId, true);
             historyDrains.set(lampId, {
@@ -3215,6 +3401,7 @@ export default function App() {
               cloudEnabled: witness.cloudEnabled,
               userId: witness.userId,
               mappingCount: witness.mappingCount,
+              probeIntervalSeconds: witness.probeIntervalSeconds,
             });
             await requestHistoryBatchChunk(
               lampId,
@@ -3271,16 +3458,27 @@ export default function App() {
           const assignedProbes = meshNodesRef.current.filter(
             (node) => node.nodeKind === 'probe' && node.provisioned && node.assignedBridgeId === lampId
           );
-          const registeredProbe = historyDevice(inventory.devices, `lamp-history:${lampId}:probe-${record.probeIndex}`, 'probe');
+          const registeredProbe = registeredProbeForHistoryIndex(inventory.devices, lampId, record.probeIndex);
           const witnessedProbeId = historyProbeBindings.get(lampId)?.get(record.probeIndex) ?? null;
           const probeId = registeredProbe?.id ?? witnessedProbeId ?? (
             assignedProbes.length === 1 && drain.mappingCount === 1 && record.probeIndex === 0
               ? assignedProbes[0].id
               : `lamp-history:${lampId}:probe-${record.probeIndex}`
           );
-          if (!historyDevice(inventory.devices, probeId, 'probe')?.access.canViewHistory) {
+          // Conflicting registered and witnessed identities must fail closed.
+          const conflictingSources = Boolean(registeredProbe && witnessedProbeId && registeredProbe.id !==
+            (historyDevice(inventory.devices, witnessedProbeId, 'probe')?.id ?? witnessedProbeId));
+          if (conflictingSources || !historyDevice(inventory.devices, probeId, 'probe')?.access.canViewHistory) {
+            historyIdentityBlocks.set(lampId, {
+              accountUid: drain.userId,
+              probeIndex: record.probeIndex,
+              lastHintSeenAt: routedHistoryHints.get(lampId)?.seenAt ?? 0,
+              probeIntervalMs: Math.max(60_000, (drain.probeIntervalSeconds ?? 300) * 1000),
+              conflictingRegisteredId: conflictingSources ? registeredProbe?.id : null,
+              conflictingWitnessedId: conflictingSources ? witnessedProbeId : null,
+            });
             stopHistoryDrain(lampId);
-            addMeshLog(`[HistorySync][DEFER] lamp=${lampId} reason=probe_identity_or_history_grant_missing probeIndex=${record.probeIndex}`, lampId);
+            addMeshLog(`[HistorySync][BLOCKED] lamp=${lampId} reason=${conflictingSources ? 'probe_identity_conflict' : 'probe_identity_or_history_grant_missing'} probeIndex=${record.probeIndex} seq=${record.sequence} retry=verified_identity_or_new_routed_sample`, lampId);
             return;
           }
           const snapshot = arcHistoryRecordToProbeStatus(record);
@@ -3337,16 +3535,26 @@ export default function App() {
         }
 
         // Stop a recovery pass only on a completed batch boundary.
-        if (downloaded >= HISTORY_BATCH_LIMIT || Date.now() - drain.startedAt >= 30_000) {
+        if (downloaded >= HISTORY_PASS_RECORD_LIMIT || Date.now() - drain.startedAt >= 30_000) {
           stopHistoryDrain(lampId);
           addMeshLog(
-            `[HistorySync][PASS_DONE] lamp=${lampId} after=${record.sequence} head=${drain.head} downloaded=${downloaded} reason=bounded_pass retry=next_poll`,
+            `[HistorySync][PASS_DONE] lamp=${lampId} after=${record.sequence} head=${drain.head} downloaded=${downloaded} reason=bounded_pass retry=immediate`,
             lampId
           );
           if (probeLoggingViewsOpenRef.current) {
             void refreshRecentProbeLogs();
             void refreshRecentLampLogs(lampId);
           }
+          // No fixed 60-second pause after a successfully persisted batch.
+          // Finish the serialized write queue and release its lease before
+          // immediately starting the next bounded pass, yielding to the UI.
+          void (historyQueues.get(lampId) ?? Promise.resolve()).finally(() => {
+            setTimeout(() => {
+              if (!historySubscriptionsActive || historyOwner.debugRequested) return;
+              void beginLampHistorySync(lampId).catch((error: any) =>
+                addMeshLog(`[HistorySync][FAIL] lamp=${lampId} stage=resume error=${error?.message ?? String(error)}`, lampId));
+            }, 0);
+          });
           return;
         }
 
@@ -3434,92 +3642,10 @@ export default function App() {
           addMeshLog(`[HistorySync][FAIL] lamp=${node.id} stage=poll error=${error?.message ?? String(error)}`, node.id)
         ));
     }, 60_000);
-    const unsubscribeProvisionState = mesh.subscribeProvisioningState((nodeId, state) => {
-      const targetId = nodeId ?? selectedMeshNodeIdRef.current;
-      if (targetId) {
-        addMeshLog(`commissioning state=${state}`, targetId);
-        const label = provisioningStateLabels[state] ?? `State ${state}`;
-        setMeshProvisionProgressById((prev) => {
-          const existing = prev[targetId] ?? [];
-          if (existing[existing.length - 1] === label) return prev;
-          return {
-            ...prev,
-            [targetId]: [...existing, label].slice(-16),
-          };
-        });
-      }
-    });
-    const unsubscribeProvisionAuth = mesh.subscribeProvisioningAuth((nodeId) => {
-      const targetId = nodeId ?? selectedMeshNodeIdRef.current;
-      if (targetId) {
-        addMeshLog('commissioning auth set', targetId);
-      }
-    });
-    const unsubscribeProvisionIdentify = mesh.subscribeProvisioningIdentify((nodeId, ok, error) => {
-      const targetId = nodeId ?? selectedMeshNodeIdRef.current;
-      if (!targetId) return;
-      if (ok) {
-        addMeshLog('identify node sent', targetId);
-      } else {
-        addMeshLog(`identify node failed: ${error ?? 'unknown error'}`, targetId);
-      }
-    });
-    const unsubscribeIdentify = mesh.subscribeIdentify((nodeId, ok, error) => {
-      const targetId = nodeId ?? selectedMeshNodeIdRef.current;
-      if (!targetId) return;
-      setMeshIdentifyStateById((prev) => ({
-        ...prev,
-        [targetId]: ok ? 'identified' : 'failed',
-      }));
-      if (ok) {
-        addMeshLog('identify complete', targetId);
-      } else {
-        addMeshLog(`identify failed: ${error ?? 'unknown error'}`, targetId);
-      }
-    });
-    const unsubscribeCapabilities = mesh.subscribeProvisioningCapabilities((nodeId, capabilities) => {
-      const targetId = nodeId ?? selectedMeshNodeIdRef.current;
-      if (!targetId) return;
-      setMeshCapabilitiesById((prev) => ({ ...prev, [targetId]: capabilities }));
-      setMeshIdentifyStateById((prev) => ({ ...prev, [targetId]: 'identified' }));
-      addMeshLog('capabilities received', targetId);
-      addMeshLog(`elements=${capabilities.numberOfElements}`, targetId);
-      addMeshLog(`algorithms=${capabilities.algorithms.join(', ') || 'unavailable'}`, targetId);
-      addMeshLog(`public key=${capabilities.publicKeyAvailable ? 'available' : 'unavailable'}`, targetId);
-      addMeshLog(`static oob=${capabilities.staticOobAvailable ? 'available' : 'unavailable'}`, targetId);
-      addMeshLog(`output oob size=${capabilities.outputOobSize}`, targetId);
-      addMeshLog(
-        `output actions=${capabilities.outputOobActions.join(', ') || 'unavailable'}`,
-        targetId
-      );
-      addMeshLog(`input oob size=${capabilities.inputOobSize}`, targetId);
-      addMeshLog(
-        `input actions=${capabilities.inputOobActions.join(', ') || 'unavailable'}`,
-        targetId
-      );
-    });
-    const unsubscribeProvisionPdu = mesh.subscribeProvisioningPdu((nodeId, direction, hex) => {
-      const targetId = nodeId ?? selectedMeshNodeIdRef.current;
-      if (!targetId) return;
-      const label = direction.replace('_', ' ');
-      addMeshLog(`commission ${label} ${hex}`, targetId);
-    });
-    const unsubscribeProvisionUnicast = mesh.subscribeProvisioningUnicast((nodeId, _unicast, unicastHex, auto) => {
-      const targetId = nodeId ?? selectedMeshNodeIdRef.current;
-      if (!targetId) return;
-      const mode = auto ? 'auto' : 'manual';
-      addMeshLog(`commissioning address assigned ${unicastHex} (${mode})`, targetId);
-    });
     const unsubscribeProvisionDebug = mesh.subscribeProvisioningDebug((nodeId, message) => {
       const targetId = nodeId ?? selectedMeshNodeIdRef.current;
       if (!targetId) return;
       addMeshLog(message, targetId);
-    });
-    const unsubscribeProvisioned = mesh.subscribeProvisioned((nodeId, _unicast, unicastHex) => {
-      const targetId = nodeId ?? selectedMeshNodeIdRef.current;
-      if (!targetId) return;
-      const label = unicastHex ? `Commissioned address ${unicastHex}` : 'Commissioned address assigned';
-      addMeshLog(label, targetId);
     });
 
     return () => {
@@ -3542,6 +3668,8 @@ export default function App() {
       routedHistoryHints.clear();
       historyIdentityWitnesses.clear();
       historyProbeBindings.clear();
+      historyIdentityBlocks.clear();
+      historyCloudEpochSuspects.clear();
       requestRoutedHistorySync = null;
       clearInterval(historyPollTimer);
       historyStatusTimeouts.forEach((timer) => clearTimeout(timer));
@@ -3553,15 +3681,7 @@ export default function App() {
       unsubscribeProbeGatewayConfirmation();
       unsubscribeHistory();
       unsubscribeConnection();
-      unsubscribeProvisionState();
-      unsubscribeProvisionAuth();
-      unsubscribeProvisionIdentify();
-      unsubscribeIdentify();
-      unsubscribeCapabilities();
-      unsubscribeProvisionPdu();
-      unsubscribeProvisionUnicast();
       unsubscribeProvisionDebug();
-      unsubscribeProvisioned();
     };
   }, [mesh, meshEnabled]);
 
@@ -3656,8 +3776,8 @@ export default function App() {
       setMeshSelectedNodeId(meshNodes[0].id);
       return;
     }
-    if (meshSelectedNodeId && !meshNodes.some((node) => node.id === meshSelectedNodeId)) {
-      setMeshSelectedNodeId(meshNodes[0]?.id ?? null);
+    if (meshSelectedNodeId && !meshNodes.some((node) => node.id === meshSelectedNodeId && !isLegacyMeshNode(node))) {
+      setMeshSelectedNodeId(meshNodes.find(node => !isLegacyMeshNode(node))?.id ?? null);
     }
   }, [meshEnabled, meshNodes, meshSelectedNodeId]);
 
@@ -3784,16 +3904,20 @@ export default function App() {
 
   useEffect(() => {
     if (!selectedProbeSettings) return;
-    setProbeLoggingSettings((prev) => ({
-      ...prev,
-      loggingEnabled: selectedProbeSettings.localAppSettings.loggingEnabled,
-      loggingIntervalSec: selectedProbeSettings.localAppSettings.loggingIntervalSec,
-      sensorReadIntervalSec: selectedProbeSettings.desiredProbeSettings.regularMeasurementIntervalSec,
-      gasReadIntervalSec: selectedProbeSettings.desiredProbeSettings.gasMeasurementIntervalSec ?? prev.gasReadIntervalSec,
-      retentionDays: selectedProbeSettings.localAppSettings.retentionDays,
-      storageBudgetMb: selectedProbeSettings.localAppSettings.storageBudgetMb,
-      rawPayloadRetention: selectedProbeSettings.localAppSettings.rawPayloadRetention,
-    }));
+    setProbeLoggingSettings((prev) => {
+      const next = {
+        ...prev,
+        loggingEnabled: selectedProbeSettings.localAppSettings.loggingEnabled,
+        loggingIntervalSec: selectedProbeSettings.localAppSettings.loggingIntervalSec,
+        sensorReadIntervalSec: selectedProbeSettings.desiredProbeSettings.regularMeasurementIntervalSec,
+        gasReadIntervalSec: selectedProbeSettings.desiredProbeSettings.gasMeasurementIntervalSec ?? prev.gasReadIntervalSec,
+        retentionDays: selectedProbeSettings.localAppSettings.retentionDays,
+        storageBudgetMb: selectedProbeSettings.localAppSettings.storageBudgetMb,
+        rawPayloadRetention: selectedProbeSettings.localAppSettings.rawPayloadRetention,
+      };
+      return (Object.keys(next) as Array<keyof typeof next>).every((key) => Object.is(prev[key], next[key]))
+        ? prev : next;
+    });
   }, [selectedProbeSettings]);
 
   useEffect(() => {
@@ -4119,6 +4243,13 @@ export default function App() {
   };
 
   const handleConnect = async () => {
+    if (Platform.OS === 'android') {
+      const node = meshNodes.find(candidate => candidate.id === selectedDeviceId);
+      if (!node || !canConnectLocalNode(node)) {
+        setStatus('Select and save a claimed ARC ID in the local node settings before connecting.');
+        return;
+      }
+    }
     setStatus('Connecting...');
     log('connect pressed', { selectedDeviceId, platform: Platform.OS });
     try {
@@ -4149,25 +4280,22 @@ export default function App() {
   };
 
   const openMeshEdit = (node: MeshNode) => {
+    setOwnerLinkTargetId(activeOwnerLinks[ownerLinkKey(node)] ?? null);
+    setOwnerLinkPickerOpen(false);
     setMeshSelectedNodeId(node.id);
     setMeshEditNodeId(node.id);
     setMeshEditName(node.name);
     setMeshEditAbbrev(node.abbreviation);
     setMeshEditColor(node.color);
-    setMeshEditOobKey(node.staticOobHex ?? '');
+
     setMeshEditError('');
   };
 
-  const handleSaveMeshEdit = () => {
+  const handleSaveMeshEdit = async () => {
     if (!meshEditNodeId) return;
     const name = meshEditName.trim();
     if (!name) {
       setMeshEditError('Name is required.');
-      return;
-    }
-    const normalizedOob = meshEditOobKey.trim() ? normalizeOobHex(meshEditOobKey) : '';
-    if (normalizedOob && normalizedOob.length % 2 !== 0) {
-      setMeshEditError('Static OOB key must have an even number of hex characters.');
       return;
     }
     const duplicate = meshNodes.some(
@@ -4176,6 +4304,12 @@ export default function App() {
     if (duplicate) {
       setMeshEditError('That name is already in use.');
       return;
+    }
+    const editingNode = meshNodes.find(node => node.id === meshEditNodeId);
+    if (Platform.OS === 'android' && editingNode &&
+        (editingNode.nodeKind === 'lamp' || editingNode.nodeKind === 'probe') &&
+        ownerLinkTargetId !== (activeOwnerLinks[ownerLinkKey(editingNode)] ?? null)) {
+      if (!await saveOwnerLink(ownerLinkTargetId)) return;
     }
     const abbreviation = meshEditAbbrev.trim() || buildMeshAbbrev(name);
     setMeshNodes((prev) =>
@@ -4186,7 +4320,6 @@ export default function App() {
               name,
               abbreviation,
               color: meshEditColor,
-              staticOobHex: normalizedOob || null,
             }
           : node
       )
@@ -4202,7 +4335,7 @@ export default function App() {
     setMeshScanning(true);
     setMeshStatus('Scanning for ARC devices...');
     try {
-      const found = await mesh.scanUnprovisioned();
+      const found = (await mesh.scanArcDevices()).filter(isArcScanCandidate);
       if (selectedMeshNodeIdRef.current) {
         addMeshLog(`Scan complete (${found.length} found)`, selectedMeshNodeIdRef.current);
       }
@@ -4220,51 +4353,12 @@ export default function App() {
     }
   };
 
-  const handleMeshIdentify = async (node: MeshNode) => {
-    if (!mesh.isAvailable) {
-      setMeshStatus('ARC native transport module not available.');
-      return;
-    }
-    setMeshSelectedNodeId(node.id);
-    setMeshStatus('Opening ARC commissioning link...');
-    setMeshIdentifyStateById((prev) => ({ ...prev, [node.id]: 'identifying' }));
-    try {
-      await mesh.openProvisioningLink(node.id);
-      setMeshStatus('Identifying node...');
-      await mesh.identifyNode(node.id);
-    } catch (err: any) {
-      setMeshIdentifyStateById((prev) => ({ ...prev, [node.id]: 'failed' }));
-      setMeshStatus(`Identify failed: ${err?.message ?? String(err)}`);
-    }
-  };
-
-  const provisionMeshNode = async (node: MeshNode, oobHex: string) => {
-    setMeshSelectedNodeId(node.id);
-    setMeshStatus('Commissioning...');
-    setMeshConnecting(true);
-    setMeshProvisionError(null);
-    setMeshProvisionProgressById((prev) => ({ ...prev, [node.id]: [] }));
-    try {
-      addMeshLog('Commission start', node.id);
-      await mesh.setProvisioningUnicastAddressAuto();
-      await mesh.provision(node.id, oobHex);
-      const provisioned = await mesh.listProvisionedNodes();
-      mergeProvisionedMeshNodes(provisioned);
-      addMeshLog('Commissioned', node.id);
-      setMeshStatus('Commissioned');
-      return true;
-    } catch (err: any) {
-      const message = err?.message ?? String(err);
-      addMeshLog(`Commission failed: ${message}`, node.id);
-      setMeshStatus(`Commission failed: ${message}`);
-      setMeshProvisionError(message);
-      return false;
-    } finally {
-      setMeshConnecting(false);
-    }
-  };
-
   const connectMeshNode = async (node: MeshNode) => {
+    if (!canConnectLocalNode(node)) {
+      setMeshStatus('Select and save a claimed ARC ID in this node’s Settings before connecting.');
+      openMeshEdit(node);
+      return false;
+    }
     if (!mesh.isAvailable) {
       setMeshStatus('ARC native transport module not available.');
       return false;
@@ -4275,6 +4369,7 @@ export default function App() {
     try {
       addMeshLog('Connect start', node.id);
       await mesh.connectNode(node.id);
+      mergeProvisionedMeshNodes(await mesh.listProvisionedNodes());
       addMeshLog('Physical BLE connection requested', node.id);
       setMeshStatus('Connection requested; waiting for the device...');
       return true;
@@ -4285,27 +4380,6 @@ export default function App() {
       return false;
     } finally {
       setMeshConnecting(false);
-    }
-  };
-
-  const handleProvisionFromModal = async () => {
-    if (!meshCapabilitiesModalId) return;
-    const node = meshNodes.find((entry) => entry.id === meshCapabilitiesModalId);
-    if (!node) return;
-    const oobHex = getNodeOobKey(node);
-    if (!oobHex) {
-      setMeshProvisionError('Static OOB key not set. Update settings first.');
-      return;
-    }
-    if (oobHex.length % 2 !== 0) {
-      setMeshProvisionError('Static OOB key must have an even number of hex characters.');
-      return;
-    }
-    setMeshConfirmOob(false);
-    const ok = await provisionMeshNode(node, oobHex);
-    if (ok) {
-      await connectMeshNode(node);
-      setMeshCapabilitiesModalId(null);
     }
   };
 
@@ -4328,67 +4402,6 @@ export default function App() {
       const message = err?.message ?? String(err);
       addMeshLog(`Disconnect failed: ${message}`, node.id);
       setMeshStatus(`Disconnect failed: ${message}`);
-    } finally {
-      setMeshConnecting(false);
-    }
-  };
-
-  const handleMeshProvision = async () => {
-    if (!selectedMeshNode) return;
-    const oobHex = getNodeOobKey(selectedMeshNode);
-    if (!oobHex) {
-      setMeshStatus('Static OOB key not set. Update settings first.');
-      return;
-    }
-    if (oobHex.length % 2 !== 0) {
-      setMeshStatus('Static OOB key must have an even number of hex characters.');
-      return;
-    }
-    const ok = await provisionMeshNode(selectedMeshNode, oobHex);
-    if (ok) {
-      await connectMeshNode(selectedMeshNode);
-    }
-  };
-
-  const handleMeshConnect = async () => {
-    if (!selectedMeshNode) {
-      setMeshStatus('Select a node first');
-      return;
-    }
-    if (!mesh.isAvailable) {
-      setMeshStatus('ARC native transport module not available.');
-      return;
-    }
-    let stage: 'Provision' | 'Connect' = 'Connect';
-    setMeshConnecting(true);
-    try {
-      if (!selectedMeshNode.provisioned) {
-        stage = 'Provision';
-        setMeshStatus('Commissioning...');
-        const oobHex = getNodeOobKey(selectedMeshNode);
-        if (!oobHex) {
-          throw new Error('Static OOB key not set. Update settings first.');
-        }
-        if (oobHex.length % 2 !== 0) {
-          throw new Error('Static OOB key must have an even number of hex characters.');
-        }
-        addMeshLog('Commission start', selectedMeshNode.id);
-        await mesh.provision(selectedMeshNode.id, oobHex);
-        const provisioned = await mesh.listProvisionedNodes();
-        mergeProvisionedMeshNodes(provisioned);
-        addMeshLog('Commissioned', selectedMeshNode.id);
-        setMeshStatus('Commissioned');
-      }
-
-      stage = 'Connect';
-      setMeshStatus('Connecting...');
-      addMeshLog('Connect start', selectedMeshNode.id);
-      await mesh.connectNode(selectedMeshNode.id);
-      addMeshLog('Physical BLE connection requested', selectedMeshNode.id);
-      setMeshStatus('Connection requested; waiting for the device...');
-    } catch (err: any) {
-      addMeshLog(`Connect failed: ${err?.message ?? String(err)}`, selectedMeshNode.id);
-      setMeshStatus(`${stage === 'Provision' ? 'Commission' : stage} failed: ${err?.message ?? String(err)}`);
     } finally {
       setMeshConnecting(false);
     }
@@ -4420,7 +4433,7 @@ export default function App() {
   const authorizeLampCommand = async (permission: 'canControl' | 'canEditSettings') => {
     if (!meshEnabled) return connected;
     const view = selectedLampViewRef.current;
-    if (!currentCloudUserRef.current || !view.node?.connected || (view.device && portalInventoryCached)) return false;
+    if (!currentCloudUserRef.current || !view.node || !isCurrentArcLamp(view.node) || !view.node.connected || (view.device && portalInventoryCached)) return false;
     const requestedUserId = currentCloudUserRef.current;
     if (!view.device) return Boolean(view.node.provisioned && !knownCanonicalDeviceIdsRef.current.has(view.node.id)); // Existing local commissioning path.
     try {
@@ -5158,6 +5171,14 @@ export default function App() {
       return;
     }
 
+    if (Platform.OS === 'android' &&
+        (!canConnectLocalNode(routedNode) ||
+         (bridge && !canConnectLocalNode(bridge)) ||
+         (previousBridgeId && !canConnectLocalNode(meshNodesRef.current.find(n => n.id === previousBridgeId) ?? routedNode)))) {
+      setMeshStatus('Associate the Probe and its Lamp with claimed ARC IDs before changing the route.');
+      return;
+    }
+
     if (!bridgeId) {
       if (previousBridgeId) {
         try {
@@ -5243,7 +5264,7 @@ export default function App() {
           `[ProbeRoute][BRIDGE][CONNECT_FAIL] probe=${nodeId} bridge=${bridgeId} bridgeKind=${bridgeKind} error=${bridgeError?.message ?? String(bridgeError)}`
         );
         addMeshLog(
-          `Probe route configured, but ${bridgeKind} telemetry subscription failed: ${bridgeError?.message ?? String(bridgeError)}`,
+          `Probe route requested, but ${bridgeKind} telemetry subscription failed: ${bridgeError?.message ?? String(bridgeError)}`,
           bridgeId
         );
       }
@@ -5305,10 +5326,12 @@ export default function App() {
 
   useEffect(() => {
     if (!meshEnabled || !mesh.isAvailable || !meshTransportReady) return;
-    meshNodes.forEach((node) => {
+    meshNodes.filter(node => !isLegacyMeshNode(node)).forEach((node) => {
       const bridgeId = node.assignedGatewayId ?? node.assignedBridgeId;
       const bridgeKind = node.assignedGatewayId ? 'Gateway' : 'Lamp';
       if (node.nodeKind !== 'probe' || !bridgeId) return;
+      const bridgeNode = meshNodes.find(candidate => candidate.id === bridgeId);
+      if (Platform.OS === 'android' && (!canConnectLocalNode(node) || !bridgeNode || !canConnectLocalNode(bridgeNode))) return;
 
       const canonicalProbe = canonicalDeviceForNode(node, portalDevices);
       if (canonicalProbe && (!canonicalProbe.access.canEditSettings || portalInventoryCached)) return;
@@ -5382,7 +5405,7 @@ export default function App() {
   const openAssignedNodeFromGateway = (node: MeshNode) => {
     setMeshEditNodeId(null);
     setMeshEditError('');
-    setMeshEditOobKey('');
+
     setMeshSelectedNodeId(node.id);
     setActiveTabSafe(node.nodeKind === 'probe' ? 'sensors' : 'home');
   };
@@ -8316,7 +8339,7 @@ export default function App() {
           <TouchableOpacity
             style={styles.button}
             onPress={handleConnect}
-            disabled={connected || (!selectedDeviceId && Platform.OS !== 'web')}
+            disabled={connected || (!selectedDeviceId && Platform.OS !== 'web') || (Platform.OS === 'android' && !meshNodes.some(node => node.id === selectedDeviceId && canConnectLocalNode(node)))}
           >
             <Text style={styles.buttonText}>{t('comms.connect')}</Text>
           </TouchableOpacity>
@@ -8372,16 +8395,22 @@ export default function App() {
         : '-- °C';
     const onLabel = item.status ? minutesToTime(item.status.timerOn) : '--:--';
     const offLabel = item.status ? minutesToTime(item.status.timerOff) : '--:--';
-    const identifyState = meshIdentifyStateById[item.id] ?? 'idle';
+    // Card copy stays compact; full routing diagnostics remain in node settings.
+    // An assignment describes the relationship, not whether the route is online.
+    const tileRouteLabel = item.assignedGatewayId
+      ? `Assigned · ${assignedGateway?.name ?? 'Gateway'}`
+      : item.assignedBridgeId
+        ? `Assigned · ${assignedLamp?.name ?? 'Lamp'}`
+        : formatProbeRouteLabel(item, assignedGateway, assignedLamp);
     const routedProbe = isProbe && Boolean(item.assignedGatewayId || item.assignedBridgeId);
     const routedProbeOnline = routedProbe && isRoutedProbeTelemetryRecent(item);
     const routedProbeBridgeReady = routedProbe && Boolean(assignedGateway?.connected || assignedLamp?.connected);
     const effectivelyOnline = item.connected || routedProbeOnline || routedProbeBridgeReady;
     let actionDisabled = meshConnecting || meshScanning;
-    let actionLabel = 'Identify';
+    let actionLabel = 'Connect';
     let actionStyle = styles.buttonSecondary;
     let actionPrimary = false;
-    let actionHandler: () => void = () => handleMeshIdentify(item);
+    let actionHandler: () => void = () => { void connectMeshNode(item); };
 
     if (routedProbe) {
       if (routedProbeOnline || routedProbeBridgeReady) {
@@ -8397,7 +8426,7 @@ export default function App() {
           else if (item.assignedBridgeId) void assignNodeToLamp(item.id, item.assignedBridgeId);
         };
       }
-    } else if (item.provisioned) {
+    } else {
       if (item.connected) {
         actionLabel = 'Disconnect';
         actionHandler = () => disconnectMeshNode(item);
@@ -8407,23 +8436,20 @@ export default function App() {
         actionPrimary = true;
         actionHandler = () => connectMeshNode(item);
       }
-    } else if (identifyState === 'identifying') {
-      actionLabel = 'Identifying...';
-      actionHandler = () => undefined;
-    } else if (identifyState === 'identified') {
-      actionLabel = 'Commission';
-      actionStyle = styles.button;
-      actionPrimary = true;
-      actionHandler = () => {
-        setMeshCapabilitiesModalId(item.id);
-        setMeshConfirmOob(false);
-        setMeshProvisionError(null);
-      };
+    }
+
+    if (Platform.OS === 'android' && !item.connected &&
+        (isLamp || isProbe) && !canConnectLocalNode(item)) {
+      actionLabel = 'Select ARC ID';
+      actionHandler = () => openMeshEdit(item);
+      actionDisabled = meshConnecting || meshScanning;
+      actionStyle = styles.buttonSecondary;
+      actionPrimary = false;
     }
 
     return (
       <TouchableOpacity
-        style={[styles.meshTile, selected && styles.meshTileSelected]}
+        style={[styles.meshTile, windowWidth >= 600 && styles.meshTileTwoColumn, selected && styles.meshTileSelected]}
         onPress={() => setMeshSelectedNodeId(item.id)}
       >
         <View style={styles.meshTileHeader}>
@@ -8434,20 +8460,19 @@ export default function App() {
             <Text style={styles.meshTileTitle} numberOfLines={1}>
               {item.name}
             </Text>
-            <Text style={[styles.meshTileSubtitle, item.nodeKind === 'probe' && styles.meshTileSubtitleProbe, item.nodeKind === 'gateway' && styles.meshTileSubtitleGateway]}>
+            <Text
+              style={[styles.meshTileSubtitle, item.nodeKind === 'probe' && styles.meshTileSubtitleProbe, item.nodeKind === 'gateway' && styles.meshTileSubtitleGateway]}
+              numberOfLines={1}
+            >
               {getMeshNodeKindLabel(item.nodeKind)}
             </Text>
             {isProbe ? (
-              <Text style={styles.meshTileSubtitle} numberOfLines={1}>
-                {formatProbeRouteLabel(item, assignedGateway, assignedLamp)}
+              <Text style={styles.meshTileSubtitle} numberOfLines={1} ellipsizeMode="tail">
+                {tileRouteLabel}
               </Text>
             ) : null}
-            {!item.provisioned && <Text style={styles.meshTileSubtitle}>{t('comms.new')}</Text>}
-            {!item.provisioned && item.uuid && (
-              <Text style={styles.meshTileSubtitle} numberOfLines={1}>
-                {item.uuid}
-              </Text>
-            )}
+            {!item.provisioned && <Text style={styles.meshTileSubtitle} numberOfLines={1}>{t('comms.new')}</Text>}
+            {/* The full UUID is available in node settings, not in the fixed-height tile. */}
           </View>
           <TouchableOpacity
             style={styles.meshTileGear}
@@ -8471,15 +8496,23 @@ export default function App() {
                   }`
                 : `T: ${tempLabel}   On/Off: ${onLabel}/${offLabel}`}
           </Text>
-          <TouchableOpacity
-            style={[styles.meshTileAction, actionStyle]}
-            onPress={actionHandler}
-            disabled={actionDisabled || actionLabel === 'Identifying...'}
-          >
-            <Text style={actionPrimary ? styles.buttonText : styles.buttonTextLight}>
-              {actionLabel}
-            </Text>
-          </TouchableOpacity>
+          <View style={styles.meshTileActionSlot}>
+            <TouchableOpacity
+              style={[styles.meshTileAction, actionStyle]}
+              onPress={actionHandler}
+              disabled={actionDisabled}
+              accessibilityRole="button"
+            >
+              <Text
+                style={actionPrimary ? styles.buttonText : styles.buttonTextLight}
+                numberOfLines={1}
+                adjustsFontSizeToFit
+                minimumFontScale={0.85}
+              >
+                {actionLabel}
+              </Text>
+            </TouchableOpacity>
+          </View>
         </View>
         <View
           style={[
@@ -8493,7 +8526,9 @@ export default function App() {
 
   const renderMeshComms = () => {
     const title = threadEnabled ? 'Thread Connections' : 'ARC Connections';
-    const sortedNodes = [...meshNodes].sort((a, b) => {
+    // FlatList requires a new key when numColumns changes after a rotation.
+    const tileColumns = windowWidth >= 600 ? 2 : 1;
+    const sortedNodes = meshNodes.filter(node => !isLegacyMeshNode(node)).sort((a, b) => {
       if (a.connected !== b.connected) return a.connected ? -1 : 1;
       if (a.provisioned !== b.provisioned) return a.provisioned ? -1 : 1;
       return a.name.localeCompare(b.name);
@@ -8662,13 +8697,14 @@ export default function App() {
           <Text style={styles.status}>{meshStatus}</Text>
         </View>
         <FlatList
+          key={`arc-nodes-${tileColumns}`}
           data={sortedNodes}
           keyExtractor={(item) => item.id}
-          numColumns={2}
+          numColumns={tileColumns}
           renderItem={renderMeshTile}
           style={styles.meshList}
           contentContainerStyle={styles.meshTileList}
-          columnWrapperStyle={styles.meshTileRowWrap}
+          columnWrapperStyle={tileColumns === 2 ? styles.meshTileRowWrap : undefined}
           ListEmptyComponent={<Text style={styles.muted}>{t('comms.noArcDevices')}</Text>}
         />
 
@@ -10389,14 +10425,6 @@ export default function App() {
     );
   };
 
-  const capabilitiesNode = meshCapabilitiesModalId
-    ? meshNodes.find((node) => node.id === meshCapabilitiesModalId) ?? null
-    : null;
-  const capabilities = capabilitiesNode ? meshCapabilitiesById[capabilitiesNode.id] ?? null : null;
-  const capabilitiesProgress = capabilitiesNode
-    ? meshProvisionProgressById[capabilitiesNode.id] ?? []
-    : [];
-  const modalOobHex = capabilitiesNode ? getNodeOobKey(capabilitiesNode) : '';
   const editingMeshNode = meshEditNodeId
     ? meshNodes.find((node) => node.id === meshEditNodeId) ?? null
     : null;
@@ -10707,10 +10735,10 @@ export default function App() {
     </ScrollView>
   );
 
-  const graphNeedsRotation = windowHeight > windowWidth;
-  const graphStageWidth = Math.max(windowWidth, windowHeight);
-  const graphStageHeight = Math.min(windowWidth, windowHeight);
-  const graphNotchInset = 48;
+  const graphNeedsRotation = Platform.OS !== 'android' && windowHeight > windowWidth;
+  const graphStageWidth = Platform.OS === 'android' ? graphViewport.width || windowWidth : Math.max(windowWidth, windowHeight);
+  const graphStageHeight = Platform.OS === 'android' ? graphViewport.height || windowHeight : Math.min(windowWidth, windowHeight);
+  const graphNotchInset = Platform.OS === 'android' ? 12 : 48;
   const graphAxisLeftGutter = 58;
   const graphAxisRightGutter = 118;
   const graphDrawerWidth = Math.min(Math.max(graphStageWidth * 0.32, 300), 390);
@@ -10721,7 +10749,12 @@ export default function App() {
   );
   const graphPlotWidth =
     graphMeasuredPlotWidth > 0 ? graphMeasuredPlotWidth : graphPlotWidthFallback;
-  const graphPlotHeight = Math.max(graphStageHeight - 104, 250);
+  // The X-axis labels are siblings of the plot. Measure the plot's actual flex
+  // allocation instead of subtracting a guessed 14 px from the whole canvas;
+  // that estimate put the bottom labels outside the Android modal viewport.
+  const graphPlotHeight = Platform.OS === 'android'
+    ? Math.max(1, graphMeasuredPlotHeight || graphStageHeight - 150)
+    : Math.max(graphStageHeight - 104, 250);
   const graphEdgeInsetPx = 4;
   // Move the graph's sliding 'now' only when graph data/window state changes,
   // not on every unrelated App render caused by BLE/mesh telemetry.
@@ -11140,7 +11173,7 @@ export default function App() {
 
   return (
     <AppThemeProvider theme={appTheme}>
-    <SafeAreaView style={styles.safeArea}>
+    <SafeAreaView style={[styles.safeArea, Platform.OS === 'android' && { paddingTop: systemInsets.top, paddingBottom: systemInsets.bottom, paddingLeft: systemInsets.left, paddingRight: systemInsets.right }] }>
       <StatusBar
         barStyle={resolvedAppTheme === 'light' ? 'dark-content' : 'light-content'}
         backgroundColor={appTheme.colors.background}
@@ -11159,7 +11192,7 @@ export default function App() {
       </View>
 
       {!localStorageOpen && !scheduleOutputGraphOpen && activeTab === 'home' ? (
-        <View style={styles.cornerNav}>
+        <View style={[styles.cornerNav, Platform.OS === 'android' && { left: 22, right: 22, bottom: 12 }] }>
           <TouchableOpacity
             style={[styles.cornerButton, settingsLocked && styles.headerActionButtonDisabled]}
             onPress={() => !settingsLocked && setActiveTabSafe((prev) => (prev === 'clock' ? 'home' : 'clock'))}
@@ -11180,7 +11213,12 @@ export default function App() {
           </TouchableOpacity>
         </View>
       ) : !localStorageOpen && !scheduleOutputGraphOpen ? (
-        <View style={styles.persistentFooter}>
+        <View
+          style={[
+            styles.persistentFooter,
+            activeTab === 'comms' && connectionsSection === 'local' && styles.persistentFooterComms,
+          ]}
+        >
           <TouchableOpacity
             style={styles.footerBackButton}
             onPress={() => {
@@ -11223,24 +11261,24 @@ export default function App() {
             <View style={styles.footerCommsActions}>
               {meshLogExpanded ? (
                 <TouchableOpacity
-                  style={[styles.buttonSecondary, styles.footerCommsButton, { position: 'absolute', left: '50%', marginLeft: -107, width: 56 }]}
+                  style={[styles.buttonSecondary, styles.footerCommsButton, styles.footerCommsAuxButton]}
                   onPress={() => { setDebugMailboxOpen(true); addMeshLog('[DebugHistory][OPEN]', selectedLampIdRef.current); }}
                   accessibilityLabel="Open Debug History Mailbox"
                 ><Text style={styles.footerScanButtonText}>Debug</Text></TouchableOpacity>
               ) : null}
               <TouchableOpacity
-                style={[styles.buttonSecondary, styles.footerCommsButton, { position: 'absolute', left: '50%', marginLeft: -43 }]}
+                style={[styles.buttonSecondary, styles.footerCommsButton]}
                 onPress={handleMeshScan}
                 disabled={meshScanning}
                 accessibilityLabel={meshScanning ? t('comms.scanning') : t('comms.scan')}
               >
-                <Text style={styles.footerScanButtonText}>
+                <Text style={styles.footerScanButtonText} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8}>
                   {meshScanning ? t('comms.scanning') : t('comms.scan')}
                 </Text>
               </TouchableOpacity>
               {meshLogExpanded ? (
                 <TouchableOpacity
-                  style={[styles.buttonSecondary, styles.footerCommsButton, { position: 'absolute', left: '50%', marginLeft: 51, width: 56 }]}
+                  style={[styles.buttonSecondary, styles.footerCommsButton, styles.footerCommsAuxButton]}
                   onPress={() => void handleCopyMeshLog()}
                   accessibilityLabel="Copy connection log"
                 >
@@ -11256,7 +11294,7 @@ export default function App() {
       <DebugHistoryMailboxView
         visible={debugMailboxOpen}
         mailbox={debugMailbox}
-        lamps={meshNodes.filter(node => node.nodeKind === 'lamp')}
+        lamps={localLampNodes}
         preferredLampId={selectedLampNode?.id ?? null}
         sessionState={mesh.getHistorySessionState}
         theme={appTheme}
@@ -11276,6 +11314,7 @@ export default function App() {
               <View>
                 <Text style={styles.modalTitle}>{t('lamp.select')}</Text>
                 <Text style={styles.muted}>{t('lamp.selectHint')}</Text>
+                {Platform.OS === 'android' ? <Text style={styles.muted}>Hold a BLE device to link/unlink its owner cloud record.</Text> : null}
               </View>
               <TouchableOpacity
                 style={styles.iconButton}
@@ -11315,6 +11354,7 @@ export default function App() {
                       accessibilityRole="radio"
                       accessibilityState={{ selected }}
                       accessibilityLabel={`Select ${lamp.name}`}
+
                     >
                       <View style={[styles.lampSelectorBulb, { backgroundColor: lamp.color || '#29a760' }]}>
                         <Text style={styles.lampSelectorBulbText}>💡</Text>
@@ -11636,18 +11676,7 @@ export default function App() {
                         </TouchableOpacity>
                       </View>
 
-                      <View style={styles.field}>
-                        <Text style={styles.label}>{t('settings.defaultOob')}</Text>
-                        <TextInput
-                          style={styles.input}
-                          value={meshDefaultOobKey}
-                          onChangeText={setMeshDefaultOobKey}
-                          placeholder="112233..."
-                          placeholderTextColor={appTheme.colors.placeholder}
-                          autoCapitalize="none"
-                          autoCorrect={false}
-                        />
-                      </View>
+
 
                       <View style={styles.settingsExpandedDivider} />
 
@@ -11726,6 +11755,8 @@ export default function App() {
       >
         {probeGraphOpen ? <GraphLifecycleBoundary snapshotRef={graphLifecycleSnapshotRef} /> : null}
         <StatusBar hidden={probeGraphOpen} animated />
+        <SafeAreaProvider>
+        <AndroidModalInsets>
         <View
           style={[styles.graphTransitionHost, { backgroundColor: appTheme.colors.background }]}
           onLayout={({ nativeEvent }) => {
@@ -11736,7 +11767,12 @@ export default function App() {
         >
         <Reanimated.View style={[styles.graphWorkspaceScreen, graphContentFadeStyle]}>
           {probeGraphOpen ? <GraphVisualBoundary name="ROOT" /> : null}
-          <View style={styles.graphRotateViewport}>
+          <View style={styles.graphRotateViewport} onLayout={({ nativeEvent }) => {
+            if (Platform.OS === 'android') {
+              const { width, height } = nativeEvent.layout;
+              setGraphViewport(previous => previous.width === width && previous.height === height ? previous : { width, height });
+            }
+          }}>
             <View
               style={[
                 styles.graphRotateStage,
@@ -11781,9 +11817,9 @@ export default function App() {
                     disabled={!canReadLampHistory}
                     accessibilityLabel={selectedLampNode ? t('access.toggleGraphData', { name: selectedLampName }) : t('access.noSelectedLamp')}
                   >
-                    <Text style={[styles.graphSourceToggleMark, graphShowLamp && selectedLampNode && styles.graphSourceToggleMarkActive]}>
-                      {graphShowLamp && selectedLampNode ? '✓' : ''}
-                    </Text>
+                    <View style={[styles.graphSourceToggleMark, graphShowLamp && selectedLampNode && styles.graphSourceToggleMarkActive]}>
+                      {graphShowLamp && selectedLampNode ? <GraphCheckboxTick color={appTheme.colors.textStrong} size={12} /> : null}
+                    </View>
                   </TouchableOpacity>
                   <TouchableOpacity
                     style={styles.graphSourceSelect}
@@ -11797,7 +11833,8 @@ export default function App() {
                     <View style={styles.graphSourceSelectCopy}>
                       <Text style={styles.graphSourceTypeText} numberOfLines={1}>{t('node.lamp')}</Text>
                       <Text style={styles.graphSourceToggleText} numberOfLines={1} ellipsizeMode="tail">
-                        {selectedLampNode?.name ?? t('lamp.noSelected')}
+                        {selectedLampNode && lampNodes.some(node => node.id !== selectedLampNode.id && node.name === selectedLampNode.name)
+                          ? graphDeviceLabel(selectedLampNode) : selectedLampNode?.name ?? t('lamp.noSelected')}
                       </Text>
                     </View>
                     <Text style={styles.graphSourceChevron}>{graphLampPickerOpen ? '⌃' : '⌄'}</Text>
@@ -11822,13 +11859,14 @@ export default function App() {
                               setGraphFocusedPoint(null);
                               setGraphLampPickerOpen(false);
                             }}
+
                             accessibilityRole="radio"
                             accessibilityState={{ selected }}
                           >
                             <View style={[styles.lampSelectorBulb, { backgroundColor: lamp.color || '#29a760' }]}>
                               <Text style={styles.lampSelectorBulbText}>💡</Text>
                             </View>
-                            <Text style={styles.graphLampPickerName} numberOfLines={1} ellipsizeMode="tail">{lamp.name}</Text>
+                            <Text style={styles.graphLampPickerName} numberOfLines={1} ellipsizeMode="tail">{lampNodes.some(node => node.id !== lamp.id && node.name === lamp.name) ? graphDeviceLabel(lamp) : lamp.name}</Text>
                             <Text style={[styles.lampSelectorCheck, selected && styles.lampSelectorCheckSelected]}>
                               {selected ? '✓' : '○'}
                             </Text>
@@ -11858,9 +11896,9 @@ export default function App() {
                     disabled={!selectedProbeGraphId}
                     accessibilityLabel={selectedProbeGraphDisplayName ? t('access.toggleGraphData', { name: selectedProbeGraphDisplayName }) : t('access.noSelectedProbe')}
                   >
-                    <Text style={[styles.graphSourceToggleMark, graphShowProbe && selectedProbeGraphId && styles.graphSourceToggleMarkActive]}>
-                      {graphShowProbe && selectedProbeGraphId ? '✓' : ''}
-                    </Text>
+                    <View style={[styles.graphSourceToggleMark, graphShowProbe && selectedProbeGraphId && styles.graphSourceToggleMarkActive]}>
+                      {graphShowProbe && selectedProbeGraphId ? <GraphCheckboxTick color={appTheme.colors.textStrong} size={12} /> : null}
+                    </View>
                   </TouchableOpacity>
                   <TouchableOpacity
                     style={styles.graphSourceSelect}
@@ -11874,7 +11912,8 @@ export default function App() {
                     <View style={styles.graphSourceSelectCopy}>
                       <Text style={styles.graphSourceTypeText} numberOfLines={1}>{t('node.probe')}</Text>
                       <Text style={styles.graphSourceToggleText} numberOfLines={1} ellipsizeMode="tail">
-                        {selectedProbeGraphDisplayName ?? '—'}
+                        {selectedProbeNode && selectableProbeNodes.some(node => node.id !== selectedProbeNode.id && node.name === selectedProbeNode.name)
+                          ? graphDeviceLabel(selectedProbeNode) : selectedProbeGraphDisplayName ?? '—'}
                       </Text>
                     </View>
                     <Text style={styles.graphSourceChevron}>{graphProbePickerOpen ? '⌃' : '⌄'}</Text>
@@ -11917,7 +11956,7 @@ export default function App() {
                         );
                       })}
                       {selectableProbeNodes.map((node) => {
-                        const selected = !selectedPortalProbe && node.id === selectedProbeNode?.id;
+                        const selected = node.id === selectedProbeNode?.id && (!selectedPortalProbe || selectedPortalProbe.id === node.canonicalDeviceId);
                         return (
                           <TouchableOpacity
                             key={node.id}
@@ -11929,13 +11968,14 @@ export default function App() {
                               setGraphFocusedPoint(null);
                               setGraphProbePickerOpen(false);
                             }}
+
                             accessibilityRole="radio"
                             accessibilityState={{ selected }}
                           >
                             <View style={[styles.meshTileBadge, { backgroundColor: node.color }]}>
                               <Text style={styles.meshTileBadgeText}>{node.abbreviation}</Text>
                             </View>
-                            <Text style={styles.graphLampPickerName} numberOfLines={1} ellipsizeMode="tail">{node.name}</Text>
+                            <Text style={styles.graphLampPickerName} numberOfLines={1} ellipsizeMode="tail">{selectableProbeNodes.some(other => other.id !== node.id && other.name === node.name) ? graphDeviceLabel(node) : node.name}</Text>
                             <Text style={[styles.lampSelectorCheck, selected && styles.lampSelectorCheckSelected]}>
                               {selected ? '✓' : '○'}
                             </Text>
@@ -12017,7 +12057,7 @@ export default function App() {
                                 onPress={() => toggleLampGraphVisibleSignal(signalKey)}
                               >
                                 <View style={[styles.graphCheckbox, active && styles.graphCheckboxActive]}>
-                                  {active ? <Text style={styles.graphCheckboxMark}>✓</Text> : null}
+                                  {active ? <GraphCheckboxTick color={appTheme.colors.infoText} /> : null}
                                 </View>
                                 <View style={[styles.graphColorSwatch, { backgroundColor: meta.color }]} />
                                 <Text style={styles.label}>{meta.label}</Text>
@@ -12045,7 +12085,7 @@ export default function App() {
                                 onPress={() => toggleProbeGraphVisibleSignal(signalKey)}
                               >
                                 <View style={[styles.graphCheckbox, active && styles.graphCheckboxActive]}>
-                                  {active ? <Text style={styles.graphCheckboxMark}>✓</Text> : null}
+                                  {active ? <GraphCheckboxTick color={appTheme.colors.infoText} /> : null}
                                 </View>
                                 <View style={[styles.graphColorSwatch, { backgroundColor: meta.color }]} />
                                 <Text style={styles.label}>{graphSignalLabels[signalKey]}</Text>
@@ -12074,6 +12114,7 @@ export default function App() {
                     <View
                       style={[
                         styles.graphCanvas,
+                        Platform.OS === 'android' && { minHeight: 0 },
                         {
                           paddingLeft: graphAxisLeftGutter,
                           paddingRight: graphAxisRightGutter,
@@ -12124,15 +12165,16 @@ export default function App() {
                         </View>
                       ) : null}
                       <View
-                        style={[styles.graphPlotArea, { height: graphPlotHeight }]}
+                        style={[styles.graphPlotArea, Platform.OS === 'android'
+                          ? { flex: 1, minHeight: 0 }
+                          : { height: graphPlotHeight }]}
                         onLayout={({ nativeEvent }) => {
-                          const measuredWidth = nativeEvent.layout.width;
-                          if (
-                            Number.isFinite(measuredWidth) &&
-                            measuredWidth > 0 &&
-                            Math.abs(measuredWidth - graphMeasuredPlotWidth) > 0.5
-                          ) {
-                            setGraphMeasuredPlotWidth(measuredWidth);
+                          const { width: measuredWidth, height: measuredHeight } = nativeEvent.layout;
+                          if (Number.isFinite(measuredWidth) && measuredWidth > 0) {
+                            setGraphMeasuredPlotWidth(previous => Math.abs(previous - measuredWidth) > 0.5 ? measuredWidth : previous);
+                          }
+                          if (Platform.OS === 'android' && Number.isFinite(measuredHeight) && measuredHeight > 0) {
+                            setGraphMeasuredPlotHeight(previous => Math.abs(previous - measuredHeight) > 0.5 ? measuredHeight : previous);
                           }
                         }}
                       >
@@ -12193,6 +12235,8 @@ export default function App() {
           </View>
         </Reanimated.View>
         </View>
+        </AndroidModalInsets>
+        </SafeAreaProvider>
       </Modal>
 
       <Modal
@@ -12264,6 +12308,7 @@ export default function App() {
                     key={node.id}
                     style={[styles.probePickerRow, active && styles.probePickerRowActive]}
                     onPress={() => selectProbeForDataView(node)}
+
                   >
                     <View style={[styles.meshTileBadge, { backgroundColor: node.color }]}>
                       <Text style={styles.meshTileBadgeText}>{node.abbreviation}</Text>
@@ -12287,156 +12332,10 @@ export default function App() {
       </Modal>
 
 
-      {capabilitiesNode && (
-        <Modal visible transparent animationType="fade">
-          <View style={styles.meshModalBackdrop}>
-            <View style={styles.meshModalCard}>
-              <View style={styles.rowBetween}>
-                <Text style={styles.modalTitle}>{t('commission.capabilities')}</Text>
-                <TouchableOpacity
-                  style={styles.iconButton}
-                  onPress={() => {
-                    setMeshCapabilitiesModalId(null);
-                    setMeshConfirmOob(false);
-                    setMeshProvisionError(null);
-                  }}
-                >
-                  <Text style={styles.iconButtonText}>✕</Text>
-                </TouchableOpacity>
-              </View>
-              <Text style={styles.meshModalSubtitle}>{capabilitiesNode.name}</Text>
-              <ScrollView contentContainerStyle={styles.meshCapabilitiesContent}>
-                {capabilities ? (
-                  <>
-                    <View style={styles.meshCapsRow}>
-                      <Text style={styles.meshCapsLabel}>{t('commission.nodeType')}</Text>
-                      <Text style={styles.meshCapsValue}>{getMeshNodeKindLabel(capabilitiesNode.nodeKind)}</Text>
-                    </View>
-                    <View style={styles.meshCapsRow}>
-                      <Text style={styles.meshCapsLabel}>{t('commission.elements')}</Text>
-                      <Text style={styles.meshCapsValue}>{capabilities.numberOfElements}</Text>
-                    </View>
-                    <View style={styles.meshCapsRow}>
-                      <Text style={styles.meshCapsLabel}>{t('commission.algorithms')}</Text>
-                      <Text style={styles.meshCapsValue}>
-                        {capabilities.algorithms.length ? capabilities.algorithms.join(', ') : t('commission.unavailable')}
-                      </Text>
-                    </View>
-                    <View style={styles.meshCapsRow}>
-                      <Text style={styles.meshCapsLabel}>{t('commission.publicKeyOob')}</Text>
-                      <Text style={styles.meshCapsValue}>
-                        {capabilities.publicKeyAvailable ? t('commission.available') : t('commission.unavailable')}
-                      </Text>
-                    </View>
-                    <View style={styles.meshCapsRow}>
-                      <Text style={styles.meshCapsLabel}>{t('commission.staticOob')}</Text>
-                      <Text style={styles.meshCapsValue}>
-                        {capabilities.staticOobAvailable ? t('commission.available') : t('commission.unavailable')}
-                      </Text>
-                    </View>
-                    <View style={styles.meshCapsRow}>
-                      <Text style={styles.meshCapsLabel}>{t('commission.outputOobSize')}</Text>
-                      <Text style={styles.meshCapsValue}>{capabilities.outputOobSize}</Text>
-                    </View>
-                    <View style={styles.meshCapsRow}>
-                      <Text style={styles.meshCapsLabel}>{t('commission.outputActions')}</Text>
-                      <Text style={styles.meshCapsValue}>
-                        {capabilities.outputOobActions.length
-                          ? capabilities.outputOobActions.join(', ')
-                          : t('commission.unavailable')}
-                      </Text>
-                    </View>
-                    <View style={styles.meshCapsRow}>
-                      <Text style={styles.meshCapsLabel}>{t('commission.inputOobSize')}</Text>
-                      <Text style={styles.meshCapsValue}>{capabilities.inputOobSize}</Text>
-                    </View>
-                    <View style={styles.meshCapsRow}>
-                      <Text style={styles.meshCapsLabel}>{t('commission.inputActions')}</Text>
-                      <Text style={styles.meshCapsValue}>
-                        {capabilities.inputOobActions.length
-                          ? capabilities.inputOobActions.join(', ')
-                          : t('commission.unavailable')}
-                      </Text>
-                    </View>
-                  </>
-                ) : (
-                  <Text style={styles.muted}>{t('commission.capabilitiesPending')}</Text>
-                )}
-
-                <View style={styles.meshCapsRow}>
-                  <Text style={styles.meshCapsLabel}>{t('commission.staticOobKey')}</Text>
-                  <Text style={styles.meshCapsValue}>
-                    {modalOobHex ? maskOobHex(modalOobHex) : t('commission.notSet')}
-                  </Text>
-                </View>
-
-                {meshProvisionError ? <Text style={styles.meshError}>{meshProvisionError}</Text> : null}
-
-                {capabilitiesProgress.length > 0 && (
-                  <View style={styles.meshProgressList}>
-                    <Text style={styles.meshCapsLabel}>{t('commission.progress')}</Text>
-                    {capabilitiesProgress.map((line, index) => (
-                      <Text key={`${index}-${line}`} style={styles.meshProgressLine}>
-                        {line}
-                      </Text>
-                    ))}
-                  </View>
-                )}
-              </ScrollView>
-
-              {meshConfirmOob ? (
-                <View style={styles.meshModalActions}>
-                  <Text style={styles.meshConfirmText}>
-                    {t('commission.useStoredOob', { key: modalOobHex ? maskOobHex(modalOobHex) : '' })}
-                  </Text>
-                  <View style={styles.meshModalActionsRow}>
-                    <TouchableOpacity
-                      style={styles.buttonSecondary}
-                      onPress={() => setMeshConfirmOob(false)}
-                    >
-                      <Text style={styles.buttonTextLight}>{t('common.cancel')}</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity style={styles.button} onPress={handleProvisionFromModal}>
-                      <Text style={styles.buttonText}>{t('common.ok')}</Text>
-                    </TouchableOpacity>
-                  </View>
-                </View>
-              ) : (
-                <View style={styles.meshModalActions}>
-                  <TouchableOpacity
-                    style={styles.buttonSecondary}
-                    onPress={() => {
-                      setMeshCapabilitiesModalId(null);
-                      setMeshConfirmOob(false);
-                      setMeshProvisionError(null);
-                    }}
-                  >
-                    <Text style={styles.buttonTextLight}>{t('common.close')}</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={styles.button}
-                    onPress={() => {
-                      if (!modalOobHex) {
-                        setMeshProvisionError('Static OOB key not set. Update settings first.');
-                        return;
-                      }
-                      setMeshConfirmOob(true);
-                    }}
-                    disabled={meshConnecting}
-                  >
-                    <Text style={styles.buttonText}>{t('commission.commission')}</Text>
-                  </TouchableOpacity>
-                </View>
-              )}
-            </View>
-          </View>
-        </Modal>
-      )}
-
       {meshEditNodeId && (
         <Modal visible transparent animationType="fade">
           <View style={styles.meshModalBackdrop}>
-            <View style={styles.meshModalCard}>
+            <View style={[styles.meshModalCard, { maxHeight: '92%' }]}>
               <View style={styles.rowBetween}>
                 <Text style={styles.modalTitle}>{t('commission.editNode')}</Text>
                 <TouchableOpacity
@@ -12444,12 +12343,13 @@ export default function App() {
                   onPress={() => {
                     setMeshEditNodeId(null);
                     setMeshEditError('');
-                    setMeshEditOobKey('');
+
                   }}
                 >
                   <Text style={styles.iconButtonText}>✕</Text>
                 </TouchableOpacity>
               </View>
+              <ScrollView nestedScrollEnabled keyboardShouldPersistTaps="handled" contentContainerStyle={{ gap: 12 }}>
               <View style={styles.field}>
                 <Text style={styles.label}>{t('commission.name')}</Text>
                 <TextInput
@@ -12468,6 +12368,55 @@ export default function App() {
                   </Text>
                 </View>
               </View>
+              {Platform.OS === 'android' && editingMeshNode &&
+                  (editingMeshNode.nodeKind === 'lamp' || editingMeshNode.nodeKind === 'probe') ? (
+                <View style={styles.gatewaySetupBlock}>
+                  <Text style={styles.label}>Claimed ARC device ID</Text>
+                  <Text style={styles.muted}>Local BLE: {editingMeshNode.blePeripheralId ?? editingMeshNode.id}</Text>
+                  <Text style={styles.muted}>
+                    Select the already-claimed device corresponding to this physical node.
+                    The association is saved on this phone only and does not claim or authenticate hardware.
+                  </Text>
+                  <TouchableOpacity
+                    style={styles.gatewaySetupChip}
+                    onPress={() => setOwnerLinkPickerOpen(open => !open)}
+                    accessibilityRole="button"
+                    accessibilityLabel="Choose claimed ARC device"
+                    disabled={ownerLinkSaving}
+                  >
+                    <Text style={styles.firmwareTypeValue}>
+                      {ownerLinkTargetId
+                        ? `${ownerLinkCandidates.find(device => device.id === ownerLinkTargetId)?.displayName ?? 'Selected ARC device'} · ${ownerLinkTargetId}`
+                        : 'Choose claimed ARC device  ⌄'}
+                    </Text>
+                  </TouchableOpacity>
+                  {ownerLinkPickerOpen ? (
+                    <ScrollView style={{ maxHeight: 190 }} nestedScrollEnabled>
+                      {ownerLinkCandidates.map(device => (
+                        <TouchableOpacity key={device.id} style={styles.gatewaySetupChip}
+                          onPress={() => { setOwnerLinkTargetId(device.id); setOwnerLinkPickerOpen(false); }}>
+                          <Text style={styles.firmwareTypeValue}>{device.displayName}</Text>
+                          <Text style={styles.muted}>{device.id}</Text>
+                        </TouchableOpacity>
+                      ))}
+                      {ownerLinkExistingTarget ? (
+                        <TouchableOpacity style={styles.gatewaySetupChip}
+                          onPress={() => { setOwnerLinkTargetId(null); setOwnerLinkPickerOpen(false); }}>
+                          <Text style={styles.muted}>Remove local association</Text>
+                        </TouchableOpacity>
+                      ) : null}
+                      {!ownerLinkCandidates.length ? (
+                        <Text style={styles.muted}>No available claimed devices. Sign in and refresh device ownership.</Text>
+                      ) : null}
+                    </ScrollView>
+                  ) : null}
+                  <Text style={styles.muted}>
+                    {ownerLinkExistingTarget === ownerLinkTargetId && ownerLinkExistingTarget && canConnectLocalNode(editingMeshNode)
+                      ? 'Associated — Connect enabled. The saved mapping will reconnect on the next launch.'
+                      : 'Save the selection before using Connect.'}
+                  </Text>
+                </View>
+              ) : null}
               {editingMeshNode?.nodeKind === 'gateway' || editingMeshNode?.nodeKind === 'lamp' ? (
                 <View style={styles.gatewaySetupBlock}>
                   <View>
@@ -12527,18 +12476,7 @@ export default function App() {
                   maxLength={4}
                 />
               </View>
-              <View style={styles.field}>
-                <Text style={styles.label}>{t('commission.staticOobHex')}</Text>
-                <TextInput
-                  style={styles.input}
-                  value={meshEditOobKey}
-                  onChangeText={setMeshEditOobKey}
-                  placeholder="112233..."
-                  placeholderTextColor={appTheme.colors.placeholder}
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                />
-              </View>
+
               <View style={styles.field}>
                 <Text style={styles.label}>{t('commission.tileColor')}</Text>
                 <View style={styles.meshColorRow}>
@@ -12555,6 +12493,7 @@ export default function App() {
                   ))}
                 </View>
               </View>
+              </ScrollView>
               {meshEditError ? <Text style={styles.meshError}>{meshEditError}</Text> : null}
               <View style={styles.meshModalActions}>
                 <TouchableOpacity
@@ -12562,13 +12501,13 @@ export default function App() {
                   onPress={() => {
                     setMeshEditNodeId(null);
                     setMeshEditError('');
-                    setMeshEditOobKey('');
+
                   }}
                 >
                   <Text style={styles.buttonTextLight}>{t('common.cancel')}</Text>
                 </TouchableOpacity>
-                <TouchableOpacity style={styles.button} onPress={handleSaveMeshEdit}>
-                  <Text style={styles.buttonText}>{t('common.save')}</Text>
+                <TouchableOpacity style={styles.button} onPress={() => void handleSaveMeshEdit()} disabled={ownerLinkSaving}>
+                  <Text style={styles.buttonText}>{ownerLinkSaving ? 'Saving...' : t('common.save')}</Text>
                 </TouchableOpacity>
               </View>
             </View>
@@ -12617,6 +12556,14 @@ export default function App() {
     </SafeAreaView>
     </AppThemeProvider>
   );
+}
+
+function AndroidModalInsets({ children }: { children: React.ReactNode }) {
+  const insets = useSafeAreaInsets();
+  // Android Modal (navigationBarTranslucent=false) is already measured above
+  // the system navigation bar. Applying its bottom safe inset again left an
+  // empty strip and squeezed the DATA chart in landscape.
+  return <View style={{ flex: 1, ...(Platform.OS === 'android' ? { paddingTop: insets.top, paddingLeft: insets.left, paddingRight: insets.right } : {}) }}>{children}</View>;
 }
 
 const createStyles = (theme: AppTheme) => StyleSheet.create({
@@ -14595,7 +14542,12 @@ const createStyles = (theme: AppTheme) => StyleSheet.create({
     borderWidth: 1,
     padding: 10,
     flex: 1,
-    height: 150,
+    height: 180,
+    overflow: 'hidden',
+  },
+  meshTileTwoColumn: {
+    // Keep the last tile the same width as tiles in a complete two-column row.
+    maxWidth: '49%',
   },
   meshTileSelected: {
     borderColor: theme.colors.info,
@@ -14604,7 +14556,8 @@ const createStyles = (theme: AppTheme) => StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'flex-start',
     gap: 8,
-    minHeight: 58,
+    height: 78,
+    flexShrink: 0,
   },
   meshTileBadge: {
     width: 32,
@@ -14620,8 +14573,10 @@ const createStyles = (theme: AppTheme) => StyleSheet.create({
   },
   meshTileTitleWrap: {
     flex: 1,
+    minWidth: 0,
     gap: 2,
-    minHeight: 58,
+    height: 78,
+    overflow: 'hidden',
   },
   meshTileGear: {
     padding: 4,
@@ -14649,6 +14604,7 @@ const createStyles = (theme: AppTheme) => StyleSheet.create({
   },
   meshTileBody: {
     flex: 1,
+    minHeight: 0,
     marginTop: 4,
     justifyContent: 'space-between',
   },
@@ -14663,9 +14619,14 @@ const createStyles = (theme: AppTheme) => StyleSheet.create({
     justifyContent: 'space-between',
     marginTop: 6,
   },
+  meshTileActionSlot: {
+    height: 44,
+    justifyContent: 'flex-end',
+    flexShrink: 0,
+  },
   meshTileAction: {
     width: 112,
-    height: 42,
+    height: 44,
     alignSelf: 'flex-start',
     paddingVertical: 0,
     paddingHorizontal: 10,
@@ -14873,40 +14834,49 @@ const createStyles = (theme: AppTheme) => StyleSheet.create({
     borderTopWidth: StyleSheet.hairlineWidth,
     borderTopColor: theme.colors.border,
     backgroundColor: theme.colors.background,
-    justifyContent: 'center',
+    flexDirection: 'row',
+    alignItems: 'center',
     position: 'relative',
   },
+  persistentFooterComms: {
+    height: 62,
+    paddingVertical: 9,
+  },
   footerCommsActions: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    height: 36,
-    top: 7,
+    flex: 1,
+    minWidth: 0,
+    height: 44,
     flexDirection: 'row',
+    alignItems: 'center',
     justifyContent: 'center',
     gap: 8,
   },
   footerCommsButton: {
-    width: 86,
-    height: 36,
+    width: 96,
+    height: 44,
+    flexShrink: 1,
     paddingVertical: 0,
-    paddingHorizontal: 0,
+    paddingHorizontal: 4,
     backgroundColor: '#3979d4',
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  footerCommsAuxButton: {
+    width: 54,
   },
   footerScanButtonText: {
     color: '#FFFFFF',
     fontWeight: '700',
     textAlign: 'center',
+    fontSize: 13,
     lineHeight: 18,
   },
   footerBackButton: {
-    width: 36,
-    height: 36,
+    width: 40,
+    height: 44,
+    flexShrink: 0,
     alignItems: 'center',
     justifyContent: 'center',
-    transform: [{ translateY: 2 }],
   },
   cornerButton: {
     padding: 6,
@@ -16235,11 +16205,8 @@ const createStyles = (theme: AppTheme) => StyleSheet.create({
     borderRadius: 5,
     borderWidth: 1,
     borderColor: theme.colors.borderStrong,
-    color: theme.colors.textStrong,
-    textAlign: 'center',
-    lineHeight: 16,
-    fontSize: 12,
-    fontWeight: '900',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   graphSourceToggleMarkActive: {
     borderColor: theme.colors.textSecondary,
@@ -16419,11 +16386,6 @@ const createStyles = (theme: AppTheme) => StyleSheet.create({
   graphCheckboxActive: {
     borderColor: theme.colors.infoText,
     backgroundColor: theme.colors.surfaceInfo,
-  },
-  graphCheckboxMark: {
-    color: theme.colors.infoText,
-    fontSize: 13,
-    fontWeight: '900',
   },
   graphColorSwatch: {
     width: 12,

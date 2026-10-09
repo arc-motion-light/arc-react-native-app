@@ -1,4 +1,4 @@
-import { NativeEventEmitter, NativeModules } from 'react-native';
+import { NativeEventEmitter, NativeModules, PermissionsAndroid, Platform } from 'react-native';
 import {
   fromBase64,
   readInt16LE,
@@ -16,7 +16,6 @@ import {
   decodeArcGatewayDebugStatusFrame,
   decodeArcProbeTelemetryStatusFrame,
   decodeArcProbeGatewayChildConfirmationFrame,
-  encodeArcProbeGatewayRouteSetFrame,
   type ArcProbeTelemetryStatus,
   type ArcGatewayDebugStatus,
   type ArcProbeGatewayChildConfirmation,
@@ -47,7 +46,7 @@ import {
   type OpenMeshManualPowerControl,
   type OpenMeshManualPowerTargetControl,
 } from './openMeshProtocol';
-import type { MeshNode, MeshProvisionResult, MeshProvisioningCapabilities, MeshScanResult, ProbeSensorStatus } from './meshTypes';
+import type { MeshNode, MeshScanResult, ProbeSensorStatus } from './meshTypes';
 import { clampLampIntensity } from '../lamp/lampLimits';
 import {
   ArcHistoryOpcode,
@@ -117,16 +116,8 @@ const writeLoaderControlQueued = async (module: MeshNativeModule, nodeId: string
 
 type MeshNativeModule = {
   initialize?: () => Promise<void>;
-  scanUnprovisioned?: () => Promise<MeshScanResult[]>;
-  identifyNode?: (nodeId: string) => Promise<void>;
-  openProvisioningLink?: (nodeId: string) => Promise<void>;
-  fetchCapabilities?: (nodeId: string) => Promise<void>;
-  setProvisioningUnicastAddress?: (address: number) => Promise<void>;
-  setProvisioningUnicastAddressAuto?: () => Promise<void>;
-  provision?: (nodeId: string, oobHex?: string | null) => Promise<MeshProvisionResult>;
+  scanArcDevices?: () => Promise<MeshScanResult[]>;
   listNodes?: () => Promise<MeshNode[]>;
-  connectProxy?: () => Promise<void>;
-  disconnectProxy?: () => Promise<void>;
   connectNode?: (nodeId: string) => Promise<void>;
   disconnectNode?: (nodeId: string) => Promise<void>;
   sendVendorMessage?: (params: {
@@ -151,7 +142,7 @@ type MeshNativeModule = {
     routeMode?: 0 | 1;
     companyId: number;
     modelId: number;
-  }) => Promise<{ configured?: boolean; detail?: string; transport?: string } | null>;
+  }) => Promise<{ configured?: boolean; requestAccepted?: boolean; confirmed?: boolean; detail?: string; transport?: string } | null>;
 };
 
 const meshModule = NativeModules?.MeshManager as MeshNativeModule | undefined;
@@ -520,13 +511,13 @@ const sendVendorMessage = async (
   const appOpcode = payloadLength > 0 ? payload?.[0] ?? opcode : opcode;
   const isOpenMeshFrame = payloadLength > 0 && appOpcode === opcode && OPEN_MESH_WRAPPED_OPCODES.has(opcode);
   const meshOpcode = isOpenMeshFrame ? ARC_OPEN_MESH_VENDOR_WRAPPER_OPCODE : opcode;
-  const coreBluetoothNodeId = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(nodeId);
+  const localBleNodeId = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(nodeId) || /^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(nodeId);
   try {
     // Local ARC entries use CoreBluetooth UUIDs; commissioned ST Mesh nodes
     // use normalized mesh UUIDs/unicast addresses. Sending a CoreBluetooth ID
     // to the mesh vendor model can never resolve. The WBA app-facing service
     // accepts the same OpenMesh application frames directly on Loader RX.
-    if (isOpenMeshFrame && coreBluetoothNodeId && module.writeLoaderControl && payload) {
+    if (isOpenMeshFrame && localBleNodeId && module.writeLoaderControl && payload) {
       await writeLoaderControlQueued(module, nodeId, payload);
       logTelemetry(
         `loader-tx:${nodeId}:${appOpcode}`,
@@ -721,20 +712,10 @@ export const createMeshComms = () => {
         modelId: ARC_MESH_MODEL_ID,
       });
       console.log(`[ProbeRoute][NATIVE][RESULT] probe=${probeNodeId} bridge=${gatewayNodeId} mode=${routeMode} result=${JSON.stringify(result)}`);
-      if (result?.transport !== 'ARC_BLE') {
-        console.log(`[ProbeRoute][SET][TX] probe=${probeNodeId} bridge=${gatewayNodeId} mode=${routeMode} opcode=0x52 transport=mesh-fallback`);
-        await sendVendorMessage(
-          probeNodeId,
-          ArcMeshProbeOpcode.GATEWAY_ROUTE_SET,
-          encodeArcProbeGatewayRouteSetFrame(gatewayNodeId, routeMode),
-          false
-        );
-      } else {
-        console.log(`[ProbeRoute][SET][TX] probe=${probeNodeId} bridge=${gatewayNodeId} mode=${routeMode} opcode=0x52 transport=arc-ble`);
-      }
+      if (result?.transport !== 'ARC_BLE') throw new Error('Current ARC BLE route configuration is unavailable; no Mesh fallback was sent.');
       console.log(`[ProbeRoute][SET][DONE] probe=${probeNodeId} bridge=${gatewayNodeId} mode=${routeMode}`);
       return {
-        state: result?.configured ? 'config-requested' as const : 'native-config-missing' as const,
+        state: (result?.requestAccepted ?? result?.configured) ? 'config-requested' as const : 'native-config-missing' as const,
         detail: result?.detail ?? 'Native mesh publication/subscription config requested.',
       };
     }
@@ -894,67 +875,24 @@ export const createMeshComms = () => {
         await module.initialize();
       }
     },
-    scanUnprovisioned: async () => {
+    scanArcDevices: async () => {
       const module = ensureModule();
-      if (!module.scanUnprovisioned) return [];
-      return module.scanUnprovisioned();
-    },
-    identifyNode: async (nodeId: string) => {
-      const module = ensureModule();
-      if (!module.identifyNode) {
-        throw new Error('MeshManager.identifyNode is not available.');
+      if (Platform.OS === 'android') {
+        const permissions = Number(Platform.Version) >= 31
+          ? [PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN, PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT]
+          : [PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION];
+        const grants = await PermissionsAndroid.requestMultiple(permissions);
+        if (permissions.some(permission => grants[permission] !== PermissionsAndroid.RESULTS.GRANTED)) {
+          throw new Error('Bluetooth permission is required to discover ARC devices.');
+        }
       }
-      await module.identifyNode(nodeId);
-    },
-    openProvisioningLink: async (nodeId: string) => {
-      const module = ensureModule();
-      if (!module.openProvisioningLink) {
-        throw new Error('MeshManager.openProvisioningLink is not available.');
-      }
-      await module.openProvisioningLink(nodeId);
-    },
-    setProvisioningUnicastAddress: async (address: number) => {
-      const module = ensureModule();
-      if (!module.setProvisioningUnicastAddress) {
-        throw new Error('MeshManager.setProvisioningUnicastAddress is not available.');
-      }
-      await module.setProvisioningUnicastAddress(address);
-    },
-    setProvisioningUnicastAddressAuto: async () => {
-      const module = ensureModule();
-      if (!module.setProvisioningUnicastAddressAuto) {
-        throw new Error('MeshManager.setProvisioningUnicastAddressAuto is not available.');
-      }
-      await module.setProvisioningUnicastAddressAuto();
-    },
-    fetchCapabilities: async (nodeId: string) => {
-      const module = ensureModule();
-      if (!module.fetchCapabilities) {
-        throw new Error('MeshManager.fetchCapabilities is not available.');
-      }
-      await module.fetchCapabilities(nodeId);
-    },
-    provision: async (nodeId: string, oobHex?: string | null) => {
-      const module = ensureModule();
-      if (!module.provision) throw new Error('MeshManager.provision is not available.');
-      await module.provision(nodeId, oobHex ?? null);
+      if (!module.scanArcDevices) throw new Error('Current ARC BLE discovery is unavailable.');
+      return module.scanArcDevices();
     },
     listProvisionedNodes: async () => {
       const module = ensureModule();
       if (!module.listNodes) return [];
       return module.listNodes();
-    },
-    connectAll: async () => {
-      const module = ensureModule();
-      if (module.connectProxy) {
-        await module.connectProxy();
-      }
-    },
-    disconnectAll: async () => {
-      const module = ensureModule();
-      if (module.disconnectProxy) {
-        await module.disconnectProxy();
-      }
     },
     connectNode: async (nodeId: string) => {
       const module = ensureModule();
@@ -1283,95 +1221,6 @@ export const createMeshComms = () => {
       });
       return () => sub.remove();
     },
-    subscribeProvisioningState: (onState: (nodeId: string | null, state: string) => void) => {
-      if (!emitter) return () => undefined;
-      const sub = emitter.addListener('MeshProvisioningState', (event: any) => {
-        const nodeId = event?.nodeId ? String(event.nodeId) : null;
-        const state = String(event?.state ?? '');
-        if (!state) return;
-        onState(nodeId, state);
-      });
-      return () => sub.remove();
-    },
-    subscribeProvisioningCapabilities: (
-      onCapabilities: (nodeId: string | null, capabilities: MeshProvisioningCapabilities) => void
-    ) => {
-      if (!emitter) return () => undefined;
-      const sub = emitter.addListener('MeshProvisioningCapabilities', (event: any) => {
-        const nodeId = event?.nodeId ? String(event.nodeId) : null;
-        const capabilities = event?.capabilities ?? event;
-        if (!capabilities) return;
-        onCapabilities(nodeId, {
-          numberOfElements: Number(capabilities.numberOfElements ?? 0),
-          algorithms: Array.isArray(capabilities.algorithms) ? capabilities.algorithms.map(String) : [],
-          publicKeyAvailable: Boolean(capabilities.publicKeyAvailable),
-          staticOobAvailable: Boolean(capabilities.staticOobAvailable),
-          outputOobSize: Number(capabilities.outputOobSize ?? 0),
-          inputOobSize: Number(capabilities.inputOobSize ?? 0),
-          outputOobActions: Array.isArray(capabilities.outputOobActions)
-            ? capabilities.outputOobActions.map(String)
-            : [],
-          inputOobActions: Array.isArray(capabilities.inputOobActions)
-            ? capabilities.inputOobActions.map(String)
-            : [],
-        });
-      });
-      return () => sub.remove();
-    },
-    subscribeIdentify: (onIdentify: (nodeId: string | null, ok: boolean, error?: string | null) => void) => {
-      if (!emitter) return () => undefined;
-      const sub = emitter.addListener('MeshIdentify', (event: any) => {
-        const nodeId = event?.nodeId ? String(event.nodeId) : null;
-        const ok = Boolean(event?.ok);
-        const error = event?.error ? String(event.error) : null;
-        onIdentify(nodeId, ok, error);
-      });
-      return () => sub.remove();
-    },
-    subscribeProvisioningAuth: (onAuth: (nodeId: string | null) => void) => {
-      if (!emitter) return () => undefined;
-      const sub = emitter.addListener('MeshProvisioningAuth', (event: any) => {
-        const nodeId = event?.nodeId ? String(event.nodeId) : null;
-        onAuth(nodeId);
-      });
-      return () => sub.remove();
-    },
-    subscribeProvisioningIdentify: (onIdentify: (nodeId: string | null, ok: boolean, error?: string) => void) => {
-      if (!emitter) return () => undefined;
-      const sub = emitter.addListener('MeshProvisioningIdentify', (event: any) => {
-        const nodeId = event?.nodeId ? String(event.nodeId) : null;
-        const ok = Boolean(event?.ok);
-        const error = event?.error ? String(event.error) : undefined;
-        onIdentify(nodeId, ok, error);
-      });
-      return () => sub.remove();
-    },
-    subscribeProvisioningPdu: (
-      onPdu: (nodeId: string | null, direction: string, hex: string) => void
-    ) => {
-      if (!emitter) return () => undefined;
-      const sub = emitter.addListener('MeshProvisioningPdu', (event: any) => {
-        const nodeId = event?.nodeId ? String(event.nodeId) : null;
-        const direction = String(event?.direction ?? 'tx');
-        const hex = String(event?.hex ?? '');
-        if (!hex) return;
-        onPdu(nodeId, direction, hex);
-      });
-      return () => sub.remove();
-    },
-    subscribeProvisioningUnicast: (
-      onUnicast: (nodeId: string | null, unicast: number, unicastHex: string, auto: boolean) => void
-    ) => {
-      if (!emitter) return () => undefined;
-      const sub = emitter.addListener('MeshProvisioningUnicast', (event: any) => {
-        const nodeId = event?.nodeId ? String(event.nodeId) : null;
-        const unicast = Number(event?.unicastAddress ?? 0);
-        const unicastHex = String(event?.unicastHex ?? '').trim();
-        const auto = Boolean(event?.auto);
-        onUnicast(nodeId, unicast, unicastHex, auto);
-      });
-      return () => sub.remove();
-    },
     subscribeProvisioningDebug: (onDebug: (nodeId: string | null, message: string) => void) => {
       if (!emitter) return () => undefined;
       const sub = emitter.addListener('MeshProvisioningDebug', (event: any) => {
@@ -1382,18 +1231,7 @@ export const createMeshComms = () => {
       });
       return () => sub.remove();
     },
-    subscribeProvisioned: (
-      onProvisioned: (nodeId: string | null, unicast: number, unicastHex: string) => void
-    ) => {
-      if (!emitter) return () => undefined;
-      const sub = emitter.addListener('MeshProvisioned', (event: any) => {
-        const nodeId = event?.nodeId ? String(event.nodeId) : null;
-        const unicast = Number(event?.unicastAddress ?? 0);
-        const unicastHex = String(event?.unicastHex ?? '').trim();
-        onProvisioned(nodeId, unicast, unicastHex);
-      });
-      return () => sub.remove();
-    },
+
   };
 };
 

@@ -7,6 +7,7 @@ require.extensions['.ts'] = (module, filename) => module._compile(ts.transpileMo
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 }
 }).outputText, filename);
 const { canonicalDeviceNodes, deviceView, scheduleRing } = require('../src/cloud/deviceView.ts');
+const { isCurrentArcLamp } = require('../src/arc/arcDeviceAdmission.ts');
 const { portalHistoryToLampLogs } = require('../src/cloud/portalTelemetry.ts');
 const access = { isOwner: false, canViewTelemetry: true, canViewHistory: true, canTrack: false, canControl: false, canEditSettings: false, canShare: false };
 const device = (type = 'lamp', flags = {}, id = 'device-1') => ({ id, type, displayName: 'Family device', owner: { uid: 'father', displayName: 'Father' }, access: { ...access, ...flags }, freshness: 'live', latestTelemetry: {
@@ -99,7 +100,7 @@ test('command boundary rechecks live grants, rejects remote paths/cache and guar
   const source = app.slice(start, end).replace('const authorizeLampCommand =', 'exports.authorize =');
   for (const scenario of ['allowed', 'revoked', 'remote', 'cache', 'switched']) {
     const cloud = device('lamp', { canControl: true }); let calls = 0;
-    const sandbox = { exports: {}, meshEnabled: true, connected: true, portalInventoryCached: scenario === 'cache',
+    const sandbox = { exports: {}, isCurrentArcLamp, meshEnabled: true, connected: true, portalInventoryCached: scenario === 'cache',
       currentCloudUserRef: { current: 'test-user' }, knownCanonicalDeviceIdsRef: { current: new Set([cloud.id]) },
       selectedLampViewRef: { current: deviceView(local('lamp', scenario !== 'remote'), [cloud], true) },
       setPortalDevices: () => {}, setStatus: () => {}, portalErrorMessage: String,
@@ -207,4 +208,40 @@ test('explicit registered source IDs bridge canonical and native identities with
   const ambiguous = device('lamp', {}, 'another-canonical'); ambiguous.telemetrySourceNodeIds = ['native-uuid'];
   const { canonicalDeviceForNode } = require('../src/cloud/deviceView.ts');
   assert.equal(canonicalDeviceForNode(native, [cloud, ambiguous]), null);
+});
+
+test('registered BLE MAC source merges with canonical Lamp without duplicate selector rows', () => {
+  const cloud = device('lamp', {}, 'canonical-lamp');
+  cloud.telemetrySourceNodeIds = ['00:80:e1:2a:e4:32'];
+  const nearby = { ...local('lamp'), id: '00:80:E1:2A:E4:32', blePeripheralId: '00:80:E1:2A:E4:32', name: 'ARC Lamp' };
+  const rows = canonicalDeviceNodes([nearby], [cloud], 'lamp');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].id, nearby.id);
+  assert.equal(rows[0].canonicalDeviceId, cloud.id);
+  assert.equal(deviceView(rows[0], [cloud], true).device.id, cloud.id);
+});
+
+test('registered BLE MAC source merges with canonical Probe without a phantom second Probe', () => {
+  const cloud = device('probe', {}, 'canonical-probe');
+  cloud.telemetrySourceNodeIds = ['aa-bb-cc-dd-ee-ff'];
+  const nearby = { ...local('probe'), id: 'AA:BB:CC:DD:EE:FF', blePeripheralId: 'AA:BB:CC:DD:EE:FF', name: 'ARC Probe T' };
+  const rows = canonicalDeviceNodes([nearby], [cloud], 'probe');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].canonicalDeviceId, cloud.id);
+});
+
+test('same display name is not identity proof and must never merge unrelated devices', () => {
+  const cloud = device('lamp', {}, 'canonical-lamp');
+  cloud.displayName = 'ARC Lamp';
+  const nearby = { ...local('lamp'), id: '00:80:E1:2A:E4:32', blePeripheralId: '00:80:E1:2A:E4:32', name: 'ARC Lamp' };
+  const rows = canonicalDeviceNodes([nearby], [cloud], 'lamp');
+  assert.equal(rows.length, 2);
+  assert.equal(rows.filter(node => node.connected).length, 1);
+});
+
+test('Android graph plot measures its available flex height and settings sync is idempotent', () => {
+  const app = fs.readFileSync('App.tsx', 'utf8');
+  assert.match(app, /setGraphMeasuredPlotHeight\(previous => Math\.abs\(previous - measuredHeight\)/);
+  assert.match(app, /Platform\.OS === 'android'\s*\? \{ flex: 1, minHeight: 0 \}/);
+  assert.match(app, /Object\.is\(prev\[key\], next\[key\]\)/);
 });

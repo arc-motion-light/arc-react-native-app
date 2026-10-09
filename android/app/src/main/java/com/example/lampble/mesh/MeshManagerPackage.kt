@@ -7,7 +7,7 @@ import com.facebook.react.uimanager.ViewManager
 
 class MeshManagerPackage : ReactPackage {
   override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> {
-    return listOf(MeshManagerModule(reactContext))
+    return listOf(ArcBleModule(reactContext))
   }
 
   override fun createViewManagers(reactContext: ReactApplicationContext): List<ViewManager<*, *>> {

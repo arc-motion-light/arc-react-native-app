@@ -48,7 +48,10 @@ test('native integration gates History, avoids global ACK and bounds transport o
   assert.ok(history.includes('!device?.access.canViewHistory'));
   assert.ok(history.includes('historyStarts.size || historyDrains.size'));
   assert.ok(history.includes('reason=record_timeout'));
-  assert.ok(history.includes('downloaded >= HISTORY_BATCH_LIMIT'));
+  assert.ok(history.includes('const HISTORY_BATCH_LIMIT = 32;'));
+  assert.ok(history.includes('downloaded >= HISTORY_PASS_RECORD_LIMIT'));
+  assert.ok(history.includes('await requestHistoryBatchChunk('));
+  assert.ok(history.includes('retry=immediate'));
   assert.ok(history.indexOf('await appendProbeLogRecord') < history.indexOf('await saveArcHistoryCursor'));
   assert.ok(history.includes('drain.userId !== currentCloudUserRef.current'));
 });

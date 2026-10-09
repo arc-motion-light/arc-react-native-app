@@ -138,6 +138,7 @@ test('witness 4845 callbacks cannot close recovery expecting 4844; both records 
     historyOwner: new (require('../src/debug/historyTransportOwner.ts').HistoryTransportOwner)(),
     debugMailbox: { onRecord: () => { throw new Error('Unexpected debug routing in production fixture'); } },
     acceptHistorySequence: recovery.acceptHistorySequence,
+    registeredProbeForHistoryIndex: () => null,
     setTimeout, clearTimeout,
     mesh: {
       requestHistoryAfter: async (_id, after) => { requests.push(after); },

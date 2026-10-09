@@ -103,6 +103,10 @@ export type MeshScanResult = {
   meshProvisioningAdvertised?: boolean | null;
   meshProxyAdvertised?: boolean | null;
   arcLocalRoleAdvertised?: boolean | null;
+  // Set only for previously GATT-validated BLE addresses by the native WBA transport.
+  arcPreviouslyValidated?: boolean | null;
+  blePeripheralId?: string | null;
+  nodeKind?: MeshNodeKind | null;
 };
 
 export type MeshProvisionResult = {

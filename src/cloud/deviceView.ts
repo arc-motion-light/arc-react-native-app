@@ -27,11 +27,19 @@ export const cloudRecordTime = (device?: PortalDeviceSummary | null) => {
 };
 
 export type DeviceViewNode = MeshNode & { canonicalDeviceId?: string };
+// BLE MAC case/separator differences are formatting, not different devices.
+// Do not normalize opaque UUIDs or infer identity from matching display names.
+const identityKey = (id: string) => {
+  const compact = id.replace(/[:-]/g, '');
+  return /^[0-9a-f]{12}$/i.test(compact) ? compact.toUpperCase() : id;
+};
+const sameIdentity = (left: string, right: string) => identityKey(left) === identityKey(right);
 export function canonicalDeviceForNode(node: MeshNode | null, inventory: PortalDeviceSummary[]) {
   if (!node) return null;
   const direct = inventory.find(device => device.id === ((node as DeviceViewNode).canonicalDeviceId ?? node.id));
   if (direct) return direct;
-  const matches = inventory.filter(device => device.type === node.nodeKind && device.telemetrySourceNodeIds?.includes(node.id));
+  const matches = inventory.filter(device => device.type === node.nodeKind &&
+    device.telemetrySourceNodeIds?.some(id => sameIdentity(id, node.id) || Boolean(node.blePeripheralId && sameIdentity(id, node.blePeripheralId))));
   return matches.length === 1 ? matches[0] : null; // Never guess by name or ambiguous route IDs.
 }
 

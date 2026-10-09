@@ -11,7 +11,7 @@ const PROBE_POWER_ROLES: ProbeNodePowerRole[] = ['activeBle', 'sleepyChild', 'ro
 const PROBE_CHILD_STATES: ProbeGatewayChildState[] = ['recent', 'sleeping', 'missedWindow', 'stale', 'unknown'];
 
 const sanitizeNodeKind = (value: unknown): MeshNodeKind =>
-  NODE_KINDS.includes(value as MeshNodeKind) ? (value as MeshNodeKind) : 'lamp';
+  NODE_KINDS.includes(value as MeshNodeKind) ? (value as MeshNodeKind) : 'other';
 
 const enumValue = <T extends string>(value: unknown, options: T[], fallback: T): T =>
   options.includes(value as T) ? (value as T) : fallback;

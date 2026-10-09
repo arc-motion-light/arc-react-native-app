@@ -235,7 +235,7 @@ RCT_EXPORT_METHOD(writeLoaderControl:(NSString *)nodeId
   });
 }
 
-RCT_EXPORT_METHOD(scanUnprovisioned:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
+RCT_EXPORT_METHOD(scanArcDevices:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
 {
   dispatch_async(dispatch_get_main_queue(), ^{
     [self ensureCentralManager];
@@ -254,7 +254,6 @@ RCT_EXPORT_METHOD(scanUnprovisioned:(RCTPromiseResolveBlock)resolve rejecter:(RC
     self.scanResolve = resolve;
     self.scanReject = reject;
 
-    [self.meshCoordinator beginUnprovisionedScan];
 
     [self.centralManager scanForPeripheralsWithServices:nil
                           options:@{ CBCentralManagerScanOptionAllowDuplicatesKey: @NO }];
@@ -554,16 +553,7 @@ RCT_EXPORT_METHOD(configureProbeGatewayRoute:(NSDictionary *)params resolver:(RC
       return;
     }
 
-  [self.meshCoordinator configureProbeGatewayRouteWithParams:params completion:^(NSDictionary *result, NSError *error) {
-    if (error != nil) {
-      reject(error.userInfo[@"code"] ?: @"ROUTE_CONFIG_FAILED", error.localizedDescription, error);
-      return;
-    }
-    [self recordTelemetryRouteForProbe:probeNodeId
-                         gatewayNodeId:gatewayNodeId
-                             routeMode:routeMode == nil ? 1 : routeMode.integerValue];
-    resolve(result ?: [NSNull null]);
-  }];
+    reject(@"ARC_ROUTE_LINK_MISSING", @"The requested Probe BLE link is unavailable; no Mesh fallback was attempted.", nil);
   });
 }
 
@@ -857,32 +847,6 @@ RCT_EXPORT_METHOD(configureProbeGatewayRoute:(NSDictionary *)params resolver:(RC
     }
   }
 
-  for (NSString *candidateId in self.scanResults) {
-    NSDictionary *candidate = self.scanResults[candidateId];
-    NSString *name = candidate[@"name"] ?: candidate[@"localName"] ?: candidate[@"cachedName"];
-    if ([self isArcProbeAdvertisementName:name]) {
-      CBPeripheral *candidatePeripheral = self.discoveredPeripherals[candidateId];
-      if (candidatePeripheral != nil) {
-        return candidatePeripheral;
-      }
-    }
-  }
-
-  for (NSString *candidateId in self.scanResults) {
-    CBPeripheral *candidatePeripheral = self.discoveredPeripherals[candidateId];
-    if (candidatePeripheral != nil && candidatePeripheral != self.telemetryPeripheral) {
-      return candidatePeripheral;
-    }
-  }
-
-  if (self.provisioningPeripheral != nil) {
-    return self.provisioningPeripheral;
-  }
-
-  if (self.telemetryPeripheral != nil) {
-    return self.telemetryPeripheral;
-  }
-
   return nil;
 }
 
@@ -1144,14 +1108,6 @@ RCT_EXPORT_METHOD(configureProbeGatewayRoute:(NSDictionary *)params resolver:(RC
   }
 
   [self.centralManager stopScan];
-  [self.meshCoordinator stopUnprovisionedScan];
-
-  for (NSDictionary *stNode in [self.meshCoordinator listUnprovisionedNodes]) {
-    NSString *nodeId = stNode[@"id"];
-    if ([nodeId isKindOfClass:NSString.class] && nodeId.length > 0 && self.scanResults[nodeId] == nil) {
-      self.scanResults[nodeId] = stNode;
-    }
-  }
 
   NSArray *results = [self.scanResults.allValues sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *left, NSDictionary *right) {
     NSString *leftName = left[@"name"] ?: @"";
@@ -1187,7 +1143,6 @@ RCT_EXPORT_METHOD(configureProbeGatewayRoute:(NSDictionary *)params resolver:(RC
   self.scanResolve = nil;
   self.scanReject = nil;
   [central stopScan];
-  [self.meshCoordinator stopUnprovisionedScan];
   reject(@"BLUETOOTH_NOT_READY", [self bluetoothStateMessage], nil);
 }
 
@@ -1204,7 +1159,7 @@ RCT_EXPORT_METHOD(configureProbeGatewayRoute:(NSDictionary *)params resolver:(RC
   NSString *cachedName = peripheral.name;
   NSString *name = localName ?: cachedName ?: @"ARC Device";
 
-  if (![self isMeshProvisioningAdvertisementWithName:name serviceData:serviceData serviceUuids:serviceUuids]) {
+  if (![self isArcLocalRoleAdvertisementName:name]) {
     return;
   }
 
@@ -1212,8 +1167,7 @@ RCT_EXPORT_METHOD(configureProbeGatewayRoute:(NSDictionary *)params resolver:(RC
   BOOL advertisesProxy = proxyData != nil || [self serviceUuids:serviceUuids contains:[CBUUID UUIDWithString:@"1828"]];
   BOOL arcLocalRoleAdvertised = [self isArcLocalRoleAdvertisementName:name];
 
-  NSString *meshUuid = [self meshUuidFromServiceData:provisioningData];
-  NSString *idValue = meshUuid ?: peripheral.identifier.UUIDString;
+  NSString *idValue = peripheral.identifier.UUIDString;
 
   NSMutableDictionary *result = [@{
     @"id": idValue,
@@ -1237,9 +1191,6 @@ RCT_EXPORT_METHOD(configureProbeGatewayRoute:(NSDictionary *)params resolver:(RC
     result[@"detail"] = @"ARC local-role device discovered over BLE. Use it as the app-facing route while Thread runs behind the Gateway/Probe role.";
   }
 
-  if (meshUuid != nil) {
-    result[@"uuid"] = meshUuid;
-  }
 
   self.scanResults[idValue] = result;
   self.discoveredPeripherals[idValue] = peripheral;

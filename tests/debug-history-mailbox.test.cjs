@@ -147,12 +147,30 @@ test('debug module has no production durability/cloud API and Scan layout is ind
  const source=fs.readFileSync(require.resolve('../src/debug/debugHistoryMailbox.ts'),'utf8');
  assert.doesNotMatch(source,/AsyncStorage|FileSystem|portalClient|appendProbeLogRecord|saveArcHistoryCursor|acknowledgeHistory/);
  const app=fs.readFileSync(require.resolve('../App.tsx'),'utf8');
- assert.match(app,/left: '50%', marginLeft: -43[\s\S]*?onPress=\{handleMeshScan\}/);
- assert.match(app,/footerCommsActions: \{\s*position: 'absolute',\s*left: 0,\s*right: 0,/);
+ const footerStyle=(name)=>{
+  const match=app.match(new RegExp(`${name}:\\s*\\{([^}]+)\\}`));
+  assert.ok(match,`${name} style must exist`);
+  return match[1];
+ };
+ const actions=footerStyle('footerCommsActions');
+ assert.match(actions,/flex:\s*1\b/);
+ assert.match(actions,/height:\s*44\b/);
+ assert.match(actions,/justifyContent:\s*'center'/);
+ assert.doesNotMatch(actions,/position:\s*'absolute'/);
+ const footer=footerStyle('persistentFooterComms');
+ assert.match(footer,/height:\s*62\b/);
+ assert.match(footer,/paddingVertical:\s*9\b/);
+ assert.match(footerStyle('footerCommsButton'),/height:\s*44\b/);
+ assert.match(footerStyle('footerCommsAuxButton'),/width:\s*54\b/);
+ const start=app.indexOf('<View style={styles.footerCommsActions}>');
+ assert.ok(start>=0,'Scan action container must exist');
+ const end=app.indexOf('</View>',start);
+ assert.ok(end>start,'Scan action container must close');
+ const scanContainer=app.slice(start,end);
+ assert.match(scanContainer,/onPress=\{handleMeshScan\}/);
+ assert.equal((scanContainer.match(/styles\.footerCommsAuxButton/g)||[]).length,2,
+  'Debug and Copy must use symmetric auxiliary button widths');
  assert.ok(app.indexOf('debugMailbox.onRecord(lampId, record, ingress.debugRunId)')<app.indexOf('queueHistoryRecordWork(lampId, record, async'));
- for(const width of [320,375,390,768]){
-  const center=width*.5-43+86/2;assert.equal(center,width/2); // independent of Debug/Copy widths and visibility
- }
 });
 
 
