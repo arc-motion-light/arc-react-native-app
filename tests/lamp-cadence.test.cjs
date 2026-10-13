@@ -37,7 +37,15 @@ test('writes recheck settings grants and UI stores values per Lamp after respons
   assert.match(save,/await authorizeLampCommand\('canEditSettings'\)/);
   assert.match(save,/await mesh.requestLampCadence/);
   const manual=app.slice(app.indexOf('  const renderManual ='),app.indexOf('  const renderClock ='));
-  assert.match(manual,/canConfigureLamp && !portalInventoryCached/);
+  // Local-first authorization is backed by a non-expired native secure receipt;
+  // cached Cloud inventory alone must not disable a valid offline permission.
+  const permissionStart=app.indexOf('  const canConfigureLamp =');
+  assert.ok(permissionStart>=0,'Lamp settings permission gate exists');
+  const permission=app.slice(permissionStart,app.indexOf('\n',permissionStart));
+  assert.match(permission,/localHardwareGrant\(selectedLampNode\)\?\.device\?\.access\.canEditSettings/);
+  assert.match(permission,/iosLampIdentityReady/);
+  assert.match(manual,/selectedLampNode\?\.connected && canConfigureLamp && cadenceRead && !cadenceBusy/);
+  assert.match(manual,/disabled=\{!cadenceEditable\}/);
   assert.match(manual,/lampCadenceById\[cadenceId\]/);
   assert.match(manual,/cadence.title/);
   assert.doesNotMatch(manual,/hasConnectedProbeLink/);

@@ -94,27 +94,70 @@ test('Lamp history adapts actual backend metrics into the existing operational g
   assert.equal(rows[0].derived.inputPowerWatts, 25); assert.equal(rows[0].state.appliedChannelsPercent, null);
   assert.equal(rows[0].provenance.sourcePath, 'portal_canonical');
 });
-test('command boundary rechecks live grants, rejects remote paths/cache and guards selection changes', async () => {
+test('command boundary enforces protected local rights, hardware identity and session continuity', async () => {
   const app = fs.readFileSync('App.tsx', 'utf8');
-  const start = app.indexOf('  const authorizeLampCommand ='); const end = app.indexOf('  const handlePowerToggle', start);
-  const source = app.slice(start, end).replace('const authorizeLampCommand =', 'exports.authorize =');
-  for (const scenario of ['allowed', 'revoked', 'remote', 'cache', 'switched']) {
-    const cloud = device('lamp', { canControl: true }); let calls = 0;
-    const sandbox = { exports: {}, Platform: { OS: 'ios' }, iosHardwareResolution: () => ({ state: 'known' }),
-      isCurrentArcLamp, meshEnabled: true, connected: true, portalInventoryCached: scenario === 'cache',
-      currentCloudUserRef: { current: 'test-user' }, knownCanonicalDeviceIdsRef: { current: new Set([cloud.id]) },
-      selectedLampViewRef: { current: deviceView(local('lamp', scenario !== 'remote'), [cloud], true) },
-      setPortalDevices: () => {}, setStatus: () => {}, portalErrorMessage: String,
+  const grantStart = app.indexOf('  const localHardwareGrant=');
+  const start = app.indexOf('  const authorizeLampCommand =');
+  const end = app.indexOf('  const handlePowerToggle', start);
+  assert.ok(grantStart >= 0 && start >= 0 && end > start, 'local authorization source exists');
+  const grantSource = app.slice(grantStart, app.indexOf('\n', grantStart));
+  const commandSource = app.slice(start, end).replace('const authorizeLampCommand =', 'exports.authorize =');
+  assert.match(commandSource, /localHardwareGrant\(view\.node\)/);
+  assert.match(commandSource, /isCurrentArcLamp\(view\.node\)/);
+  assert.match(commandSource, /nativeOfflineAccess\.read\(subject,grant\.binding\.hardwareUid\)/);
+  const source = `${grantSource}\n${commandSource}`;
+  const code = ts.transpileModule(source, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 }
+  }).outputText;
+  const hardwareUid = '1A003D001250364146313320';
+  const session = 7;
+  const binding = { hardwareUid, arcDeviceId: 'device-1', deviceType: 'lamp' };
+  const scenarios = [
+    ['allowed', true, 1], ['revoked', false, 1],
+    ['remote', false, 0], ['cached-inventory', true, 1],
+    ['switched', false, 1], ['expired', false, 0],
+    ['untrusted-receipt', false, 0], ['identity-mismatch', false, 0],
+    ['session-mismatch', false, 0], ['account-switched', false, 1],
+    ['wrong-product', false, 1], ['native-read-error', false, 1],
+    ['legacy-route', false, 0]
+  ];
+  for (const [scenario, expected, expectedReads] of scenarios) {
+    const cloud = device('lamp', { canControl: true });
+    const node = local('lamp', scenario !== 'remote');
+    const grant = {
+      nodeId: node.id, phase: 'ready', permissionSource: scenario === 'untrusted-receipt' ? 'cached_cloud' : 'native_secure_receipt',
+      permissionExpiresAtMs: scenario === 'expired' ? 500 : 2000,
+      session, binding, device: cloud,
     };
-    sandbox.portalClient = { device: async () => {
-      calls++; if (scenario === 'switched') sandbox.selectedLampViewRef.current = { node: { id: 'another', connected: true } };
-      return device('lamp', { canControl: scenario !== 'revoked' });
-    } };
-    vm.runInNewContext(ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, sandbox);
-    assert.equal(await sandbox.exports.authorize('canControl'), scenario === 'allowed', scenario);
-    if (['remote', 'cache'].includes(scenario)) assert.equal(calls, 0);
+    let reads = 0;
+    const sandbox = {
+      exports: {}, meshEnabled: scenario !== 'legacy-route',
+      localPermissionClock: 1000, hardwareOnboardingStates: [grant],
+      currentCloudUserRef: { current: 'test-user' },
+      selectedLampViewRef: { current: deviceView(node, [cloud], true) },
+      lampHardwareIdentityRef: { current: {
+        [node.id]: { state: 'identified', session: scenario === 'session-mismatch' ? 8 : session,
+          hardwareUid: scenario === 'identity-mismatch' ? 'OTHER_UID' : hardwareUid }
+      } },
+      isCurrentArcLamp: candidate => candidate?.nodeKind === 'lamp',
+      nativeOfflineAccess: { read: async (subject, uid) => {
+        reads++;
+        assert.equal(subject, 'test-user');
+        assert.equal(uid, hardwareUid);
+        if (scenario === 'switched') sandbox.selectedLampViewRef.current = { node: { id: 'another', connected: true } };
+        if (scenario === 'account-switched') sandbox.currentCloudUserRef.current = 'another-user';
+        if (scenario === 'native-read-error') throw new Error('Secure receipt unavailable');
+        return { binding: scenario === 'wrong-product' ? { ...binding, arcDeviceId: 'another' } : binding,
+          device: device('lamp', { canControl: scenario !== 'revoked' }) };
+      } },
+      setStatus: () => {},
+    };
+    vm.runInNewContext(code, sandbox);
+    assert.equal(await sandbox.exports.authorize('canControl'), expected, scenario);
+    assert.equal(reads, expectedReads, `${scenario}: protected receipt reads`);
   }
 });
+
 test('every operational/settings handler has a permission boundary and snapshot publication follows accepted local ACKs', () => {
   const app = fs.readFileSync('App.tsx', 'utf8');
   for (const name of ['handlePowerToggle','applyManualFanControl','prepareManualPwmFrequency','applyManualChannelControl','applyManualSafetyLimit','applyManualPowerTarget','handleSend']) {
