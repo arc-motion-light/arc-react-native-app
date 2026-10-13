@@ -29,6 +29,7 @@ function provider({ persistenceAvailable = true, profile } = {}) {
     },
     '@react-native-async-storage/async-storage': storage,
     'react-native': { Platform: { OS: 'ios' } },
+    './hardwareHistoryV4': { isHardwareUploadRecord: () => false },
   };
   const sandbox = { exports: {}, require: name => {
     assert.ok(name in mocks, name); return mocks[name];

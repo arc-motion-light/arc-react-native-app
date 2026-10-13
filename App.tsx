@@ -1,3 +1,13 @@
+import { probeRecordedTimestamp, selectRecordedProbePoints } from './src/graph/probeRecordedTime';
+import { localFirstHardwareBackend } from './src/security/localFirstHardwareBackend';
+import { nativeOfflineAccess } from './src/security/nativeOfflineAccess';
+import { HardwareOnboarding, type OnboardingState } from './src/mesh/hardwareOnboarding';
+import { HardwareAssociationModal } from './src/ui/HardwareAssociationModal';
+import { ArcDeviceQrScanner } from './src/ui/ArcDeviceQrScanner';
+import { ArcDeviceQrReview, type ArcQrReviewState } from './src/ui/ArcDeviceQrReview';
+import type { ArcPublicDeviceQr } from './src/arc/arcDeviceQr';
+import { localNodeColumns, iosLocalNodeGeometry } from './src/ui/localNodeLayout';
+import { hardwareHistoryProvenance, hardwareHistoryRecordId } from './src/mesh/iosHardwareHistoryProtocol';
 import { buildMonotoneSvgPath } from './src/graph/historyPlotGeometry';
 import { HistoryPlot } from './src/graph/HistoryPlot';
 import { DebugHistoryMailbox } from './src/debug/debugHistoryMailbox';
@@ -47,9 +57,9 @@ import type { ArcDeviceRegistryEntry } from './src/arc/arcRoles';
 import { loadArcDeviceRegistry, saveArcDeviceRegistry } from './src/arc/arcRegistryStorage';
 import { createMeshComms } from './src/mesh';
 import { LAMP_TELEMETRY_INTERVALS, type LampCadenceReply } from './src/mesh/lampCadenceProtocol';
-import { arcHistoryRecordToProbeStatus } from './src/mesh/arcHistoryProtocol';
-import type { ArcProbeHistoryRecord } from './src/mesh/arcHistoryProtocol';
-import { loadArcHistoryDurability, saveArcHistoryCursor } from './src/mesh/arcHistoryCursor';
+import { arcHistoryRecordToProbeStatus } from './src/mesh/iosHardwareHistoryProtocol';
+import type { ArcProbeHistoryRecord } from './src/mesh/iosHardwareHistoryProtocol';
+import { loadArcHistoryDurability, saveArcHistoryCursor, setArcHistoryGeneration } from './src/mesh/arcHistoryCursor';
 import type { ArcGatewayDebugStatus, ArcProbeGatewayChildConfirmation, HistoryIngressContext } from './src/mesh';
 import type {
   MeshNode,
@@ -58,6 +68,7 @@ import type {
   ProbeSensorStatus,
 } from './src/mesh/meshTypes';
 import { loadMeshNodes, saveMeshNodes } from './src/mesh/meshStorage';
+import { resolveHardwareBinding, associateHardwareBinding, hardwareUid, type HardwareBinding, type HardwareIdentityEvent } from './src/mesh/hardwareIdentity';
 import { loadSelectedLampId, saveSelectedLampId } from './src/lamp/lampSelectionStorage';
 import { clampLampIntensity } from './src/lamp/lampLimits';
 import {
@@ -217,6 +228,9 @@ type ScheduleOutputGraphWindow = '1h' | '6h' | '24h';
 
 const LAMP_SCHEDULE_STORAGE_KEY = 'arc.lamp.schedule.v3';
 const SCHEDULE_OUTPUT_TRACKING_STORAGE_KEY = 'arc.lamp.schedule.outputTracking.v3';
+// Release interlock: no telemetry upload during physical Lamp validation.
+// Explicitly review and remove this hold in a separately approved iOS release.
+const ARC_CLOUD_SYNC_VALIDATION_HOLD = true;
 const CONNECTIONS_SECTION_STORAGE_KEY = 'arc.connections.lastSection.v1';
 const CONNECTIONS_ICON_BLUE = '#247FA3';
 const SCHEDULE_OUTPUT_LOG_CADENCE_MS = 60 * 1000;
@@ -778,6 +792,9 @@ function ArcApp() {
   const [probeGraphDrawerOpen, setProbeGraphDrawerOpen] = useState(false);
   const [probeSettingsOpen, setProbeSettingsOpen] = useState(false);
   const [probeAdvancedSamplingOpen, setProbeAdvancedSamplingOpen] = useState(false);
+  const [probeSampleBusyById, setProbeSampleBusyById] = useState<Record<string, boolean>>({});
+  const [probeSampleConfirmedById, setProbeSampleConfirmedById] = useState<Record<string, number>>({});
+  const [probeSampleErrorById, setProbeSampleErrorById] = useState<Record<string, string>>({});
   const [probeCalibrationOpen, setProbeCalibrationOpen] = useState(false);
   const [probeAlertsOpen, setProbeAlertsOpen] = useState(false);
   const [probeDeviceInfoOpen, setProbeDeviceInfoOpen] = useState(false);
@@ -820,6 +837,21 @@ function ArcApp() {
   const [ownerLinkSaving, setOwnerLinkSaving] = useState(false);
   const autoReconnectAttemptedRef = useRef(new Set<string>());
   const [ownerLinkTargetId, setOwnerLinkTargetId] = useState<string | null>(null);
+  const [hardwareBindings,setHardwareBindings]=useState<HardwareBinding[]>([]);
+  const hardwareBindingsRef=useRef<HardwareBinding[]>([]);
+  const [hardwareBindingsReady,setHardwareBindingsReady]=useState(false);
+  const [hardwareOnboardingStates,setHardwareOnboardingStates]=useState<OnboardingState[]>([]);
+  const [iosDeviceQrScannerOpen, setIosDeviceQrScannerOpen] = useState(false);
+  const iosDeviceQrStagedScanRef = useRef<ArcPublicDeviceQr | null>(null);
+  const [iosDeviceQrReview, setIosDeviceQrReview] = useState<ArcQrReviewState | null>(null);
+  const iosDeviceQrLookupTokenRef = useRef(0);
+  const iosDeviceQrPendingSelectionRef = useRef<{ uid: string; deviceId: string; account: string } | null>(null);
+  const [localPermissionClock,setLocalPermissionClock]=useState(Date.now());
+  const offlineAccessAccount=useRef<string|null>(null);
+
+  const [lampHardwareIdentity,setLampHardwareIdentity]=useState<Record<string,HardwareIdentityEvent>>({});
+  const lampHardwareIdentityRef=useRef<Record<string,HardwareIdentityEvent>>({});
+  const hardwareBindingWriteRef=useRef<Promise<void>>(Promise.resolve());
   const [ownerConfirmedLinks, setOwnerConfirmedLinks] = useState<OwnerConfirmedDeviceLinks>({});
   const [ownerLinksAccount, setOwnerLinksAccount] = useState<string | null>(null);
   const [portalDevicesCachedAt, setPortalDevicesCachedAt] = useState<number | null>(null);
@@ -947,6 +979,7 @@ function ArcApp() {
   const [childAccountMessage, setChildAccountMessage] = useState<string | null>(null);
   const probeLoggingSettingsRef = useRef<ProbeLoggingSettings>(DEFAULT_PROBE_LOGGING_SETTINGS);
   const probeSettingsByIdRef = useRef<Record<string, ProbeSettings>>({});
+  const probeLastLoggedHasDeviceTimeRef = useRef<Record<string,boolean>>({});
   const probeLastLoggedAtByIdRef = useRef<Record<string, number>>({});
   const probeLoggingViewsOpenRef = useRef(false);
   const cloudSyncStatusLabel = !cloudSyncEnabled
@@ -990,6 +1023,11 @@ function ArcApp() {
   const saveStateRef = useRef(saveState);
   const lastTimeSyncRef = useRef<Record<string, number>>({});
   const timeSyncInFlightRef = useRef<Record<string, boolean>>({});
+  // Direct Probe time sync is scoped to a BLE connection generation, not a node's lifetime.
+  const probeTimeGenerationRef = useRef<Record<string, number>>({});
+  const probeTimeSentGenerationRef = useRef<Record<string, number>>({});
+  const probeTimeInFlightRef = useRef<Record<string, boolean>>({});
+  const probeTimeLastAttemptRef = useRef<Record<string, number>>({});
   const meshConfigVersionByNodeRef = useRef<Record<string, number>>({});
   const meshLocalConfigByNodeRef = useRef<Record<string, LocalLampScheduleState>>({});
   const [schedulePersistenceReady, setSchedulePersistenceReady] = useState(false);
@@ -1095,69 +1133,211 @@ function ArcApp() {
     }).catch(() => { if (!cancelled) setOwnerLinksAccount(uid); });
     return () => { cancelled = true; };
   }, [arcCloudSession.userId]);
-  const activeOwnerLinks = useMemo(() =>
-    ownerLinksAccount === arcCloudSession.userId && !portalInventoryCached ? ownerConfirmedLinks : {},
-    [ownerLinksAccount, arcCloudSession.userId, ownerConfirmedLinks, portalInventoryCached]);
-  // Treat the BLE MAC as a transport alias only after explicit owner selection.
-  // The projection is local: it does not grant permissions or modify Firestore.
+  const activeOwnerLinks=useMemo<OwnerConfirmedDeviceLinks>(()=>({}),[]);
+  // Retain legacy transport links for rollback, but never use MAC as physical identity.
   const resolvedHistoryInventory = useMemo(() => linkedHistoryInventory(
     meshNodes, portalDevices, activeOwnerLinks, arcCloudSession.userId,
   ), [meshNodes, portalDevices, activeOwnerLinks, arcCloudSession.userId]);
   historyInventoryRef.current = { devices: resolvedHistoryInventory, userId: historyAccessUserRef.current };
 
-  const ownerLinkSource = meshNodes.find(node => node.id === meshEditNodeId) ?? null;
-  const canConnectLocalNode = (node: MeshNode) => {
-    if (Platform.OS !== 'android' || (node.nodeKind !== 'lamp' && node.nodeKind !== 'probe')) return true;
-    return Boolean(arcCloudSession.userId && ownerLinksAccount === arcCloudSession.userId &&
-      !portalInventoryCached && validatedOwnerLinkId(node, portalDevices, activeOwnerLinks, arcCloudSession.userId));
+  useEffect(()=>{
+    let cancelled=false;
+    void AsyncStorage.getItem('arc:hardware-product-bindings:v1').then(value=>{
+      const parsed: unknown=value?JSON.parse(value):[];
+      if(!Array.isArray(parsed) || parsed.some(item=>!item || hardwareUid(item.hardwareUid)!==item.hardwareUid ||
+          typeof item.arcDeviceId!=='string' || typeof item.confirmedBy!=='string'))throw new Error('Invalid stored hardware bindings');
+      if(!cancelled){hardwareBindingsRef.current=parsed;setHardwareBindings(parsed);setHardwareBindingsReady(true);}
+    }).catch(()=>{if(!cancelled)setMeshStatus('Hardware binding storage unavailable or invalid. Prior data preserved.');});
+    return ()=>{cancelled=true;};
+  },[]);
+  useEffect(()=>mesh.subscribeHardwareIdentity(event=>{
+    const previous=lampHardwareIdentityRef.current[event.nodeId];
+    if(previous && previous.session>event.session)return;
+    const next={...lampHardwareIdentityRef.current,[event.nodeId]:event};
+    lampHardwareIdentityRef.current=next;setLampHardwareIdentity(next);
+    if(event.state==='identified'){
+      if (event.deviceType === 'probe') void syncProbeTime(event.nodeId);
+      const resolution=resolveHardwareBinding(hardwareBindingsRef.current,event.hardwareUid!);
+      setMeshStatus(resolution.state==='known'?`${event.deviceType === 'probe' ? 'Probe' : 'Lamp'} identified — ARC ${resolution.arcDeviceId}`:
+        resolution.state==='conflict'?'Hardware identity conflict. Existing bindings preserved.':'Hardware UID identified; checking claimed ARC binding.');
+    }else if(event.state!=='disconnected')setMeshStatus(`Hardware identity: ${event.state}.`);
+  }),[mesh]);
+  const hardwareBackend=useMemo(()=>localFirstHardwareBackend({
+    account:()=>currentCloudUserRef.current,
+    known:uid=>hardwareBindingsRef.current.some(binding=>binding.hardwareUid===uid),
+    consistent:(uid,result)=>resolveHardwareBinding(hardwareBindingsRef.current,uid,result.binding.arcDeviceId).state!=='conflict',
+    store:nativeOfflineAccess,
+    resolveOnline:uid=>portalClient.hardwareBinding(uid),
+    devicesOnline:()=>portalClient.devices(),
+    confirmOnline:(uid,id,kind)=>portalClient.confirmHardwareBinding(uid,id,kind),
+    revoked:error=>error instanceof PortalApiError&&[401,403].includes(error.status),
+  }),[]);
+  const hardwareOnboarding=useMemo(()=>new HardwareOnboarding(hardwareBackend,setHardwareOnboardingStates),[hardwareBackend]);
+  // ARC printed QR is public identity only. Never establish grants from QR content.
+  const handleArcDeviceQrScan = (identity: ArcPublicDeviceQr) => {
+    if (Platform.OS !== 'ios') return;
+    const account = arcCloudSession.userId;
+    const token = ++iosDeviceQrLookupTokenRef.current;
+    iosDeviceQrPendingSelectionRef.current = null;
+    setIosDeviceQrScannerOpen(false);
+    setIosDeviceQrReview({ identity, phase: 'loading' });
+    if (!account || !arcCloudSession.emailVerified) {
+      setIosDeviceQrReview({ identity, phase: 'error', error: 'Sign in with a verified ARC account first.' });
+      return;
+    }
+    void (async () => {
+      try {
+        // Read from authoritative APIs: no cached ownership, QR-provided grants or UID-based auto-claim.
+        const [binding, devicesForAccount] = await Promise.all([
+          portalClient.hardwareBinding(identity.hardwareUid),
+          portalClient.devices(),
+        ]);
+        if (token !== iosDeviceQrLookupTokenRef.current || currentCloudUserRef.current !== account) return;
+        const owned = devicesForAccount.filter(device =>
+          device.type === identity.deviceType && device.access.isOwner && device.owner.uid === account
+        );
+        if (binding) {
+          const device = owned.find(candidate => candidate.id === binding.binding.arcDeviceId);
+          if (binding.binding.hardwareUid !== identity.hardwareUid ||
+              binding.binding.deviceType !== identity.deviceType ||
+              binding.device.id !== binding.binding.arcDeviceId ||
+              binding.device.type !== identity.deviceType) {
+            throw new Error('The QR identity conflicts with the canonical hardware registry.');
+          }
+          if (!device) throw new Error('This device is not claimed by your account.');
+          setIosDeviceQrReview({ identity, phase: 'registered', registered: device });
+          return;
+        }
+        setIosDeviceQrReview({ identity, phase: 'choose', choices: owned });
+      } catch (cause) {
+        if (token !== iosDeviceQrLookupTokenRef.current || currentCloudUserRef.current !== account) return;
+        setIosDeviceQrReview({ identity, phase: 'error', error: cause instanceof Error ? cause.message : String(cause) });
+      }
+    })();
+  };
+  const closeArcDeviceQrReview = () => {
+    iosDeviceQrLookupTokenRef.current += 1;
+    setIosDeviceQrReview(null);
+  };
+  const openLocalAfterQr = () => {
+    closeArcDeviceQrReview();
+    setConnectionsSection('local');
+    setActiveTabSafe('comms');
+    setMeshStatus('QR identity identified. Connect the corresponding physical ARC node to verify its UID. Secure enrollment is not active.');
+  };
+  const chooseArcDeviceForQr = (device: PortalDeviceSummary) => {
+    const review = iosDeviceQrReview;
+    const account = arcCloudSession.userId;
+    if (!review || review.phase !== 'choose' || !account ||
+        review.identity.deviceType !== device.type || !device.access.isOwner ||
+        device.owner.uid !== account || !review.choices?.some(candidate => candidate.id === device.id)) return;
+    // Selection is explicitly user-initiated. HardwareOnboarding will independently
+    // verify the live UID and server permissions before committing a binding.
+    iosDeviceQrPendingSelectionRef.current = { uid: review.identity.hardwareUid, deviceId: device.id, account };
+    openLocalAfterQr();
+    setMeshStatus(`Selected ${device.displayName}. Connect its physical node; ARC will verify the UID before associating.`);
+  };
+  useEffect(() => {
+    const pending = iosDeviceQrPendingSelectionRef.current;
+    if (!pending || !arcCloudSession.userId || pending.account !== arcCloudSession.userId) return;
+    const eligible = hardwareOnboardingStates.find(state =>
+      state.phase === 'select' && state.hardwareUid === pending.uid &&
+      state.candidates?.some(candidate => candidate.id === pending.deviceId &&
+        candidate.access.isOwner && candidate.owner.uid === pending.account)
+    );
+    if (!eligible) return;
+    const physical = lampHardwareIdentity[eligible.nodeId];
+    if (physical?.state !== 'identified' || physical.hardwareUid !== pending.uid ||
+        physical.session !== eligible.session) return;
+    iosDeviceQrPendingSelectionRef.current = null;
+    void hardwareOnboarding.select(eligible.nodeId, pending.deviceId).catch(cause =>
+      setMeshStatus(`Association failed: ${cause instanceof Error ? cause.message : String(cause)}`)
+    );
+  }, [hardwareOnboardingStates, lampHardwareIdentity, hardwareOnboarding, arcCloudSession.userId]);
+  useEffect(() => {
+    // Discard any uncommitted QR selection when the signed-in account changes.
+    iosDeviceQrPendingSelectionRef.current = null;
+    iosDeviceQrStagedScanRef.current = null;
+    iosDeviceQrLookupTokenRef.current += 1;
+    setIosDeviceQrScannerOpen(false);
+    setIosDeviceQrReview(null);
+  }, [arcCloudSession.userId]);
+  useEffect(()=>mesh.subscribeHardwareIdentity(event=>{void hardwareOnboarding.identity(event);}),[mesh,hardwareOnboarding]);
+  useEffect(()=>mesh.subscribeConnection((id,connected)=>{if(!connected)hardwareOnboarding.cancel(id);}),[mesh,hardwareOnboarding]);
+  useEffect(()=>{
+    const previous=offlineAccessAccount.current;offlineAccessAccount.current=arcCloudSession.userId;
+    hardwareOnboarding.reset();
+    if(previous&&previous!==arcCloudSession.userId){void nativeOfflineAccess.clearSubject(previous).catch(()=>setMeshStatus('Protected permission cleanup failed; current account remains gated.'));}
+  },[hardwareOnboarding,arcCloudSession.userId]);
+  useEffect(()=>{const timer=setInterval(()=>setLocalPermissionClock(Date.now()),30000);return()=>clearInterval(timer);},[]);
+  const localHardwareGrant=(node:MeshNode|null)=>node?hardwareOnboardingStates.find(state=>state.nodeId===node.id&&state.phase==='ready'&&state.permissionSource==='native_secure_receipt'&&state.permissionExpiresAtMs!==undefined&&state.permissionExpiresAtMs>localPermissionClock):undefined;
+  useEffect(()=>{
+    for(const state of hardwareOnboardingStates){
+      if(state.phase!=='ready'||!state.binding||!state.device)continue;
+      const binding=state.binding;
+      setMeshNodes(prev=>prev.map(node=>node.id===state.nodeId && node.canonicalDeviceId!==binding.arcDeviceId?{...node,canonicalDeviceId:binding.arcDeviceId}:node));
+      setPortalDevices(prev=>{const old=prev.find(device=>device.id===state.device!.id);return [...prev.filter(device=>device.id!==state.device!.id),{...state.device!,latestTelemetry:state.device!.latestTelemetry??old?.latestTelemetry,confirmedSchedule:state.device!.confirmedSchedule??old?.confirmedSchedule}];});
+      setMeshStatus('ARC binding confirmed; local app permissions available offline. Device authorization remains separate.');
+      if(!hardwareBindingsRef.current.some(item=>item.hardwareUid===binding.hardwareUid)){
+        const next=[...hardwareBindingsRef.current,{hardwareUid:binding.hardwareUid,arcDeviceId:binding.arcDeviceId,confirmedBy:currentCloudUserRef.current??''}];
+        hardwareBindingsRef.current=next;setHardwareBindings(next);
+        void AsyncStorage.setItem('arc:hardware-product-bindings:v1',JSON.stringify(next)).catch(()=>setMeshStatus('Server binding confirmed; local cache could not be saved.'));
+      }
+    }
+  },[hardwareOnboardingStates]);
+  const blockedHardwareAssociation=hardwareOnboardingStates.find(state=>state.phase!=='disconnected'&&(state.phase!=='ready'||(state.permissionExpiresAtMs??0)<=localPermissionClock));
+  const mandatoryHardwareAssociation=blockedHardwareAssociation?.phase==='ready'?{...blockedHardwareAssociation,phase:'error' as const,error:'Local permission receipt expired. The identity binding is preserved; explicitly renew permissions online.'}:blockedHardwareAssociation;
+  const iosHardwareResolution=(node: MeshNode)=>{
+    const event=lampHardwareIdentity[node.id];
+    const local=localHardwareGrant(node);
+    if(local?.binding&&event?.state==='identified'&&local.binding.hardwareUid===event.hardwareUid)return {state:'known' as const,arcDeviceId:local.binding.arcDeviceId};
+    const expected=canonicalDeviceForNode(node,portalDevices)?.id;
+    return event?.state==='identified' && event.hardwareUid && hardwareBindingsReady
+      ? resolveHardwareBinding(hardwareBindings,event.hardwareUid,expected)
+      : {state:event?.state ?? 'pending'};
+  };
+  const resolvedIosLampNodes=Platform.OS==='ios'?localLampIdentityProjection():null;
+  function localLampIdentityProjection(){
+    return meshNodes.filter(isCurrentArcLamp).map(node=>{
+      const result=iosHardwareResolution(node);
+      return result.state==='known' && 'arcDeviceId' in result?{...node,canonicalDeviceId:result.arcDeviceId}:node;
+    });
+  }
+  const saveIosHardwareBinding=async(target:string|null):Promise<boolean>=>{
+    const node=meshNodes.find(candidate=>candidate.id===meshEditNodeId),uid=arcCloudSession.userId;
+    const event=node?lampHardwareIdentityRef.current[node.id]:undefined;
+    if(!node || !uid || currentCloudUserRef.current!==uid || !hardwareBindingsReady || portalInventoryCached ||
+       event?.state!=='identified' || !event.hardwareUid || !target){setMeshEditError('Connect and identify the Lamp, then select an owned ARC product from fresh inventory.');return false;}
+    const session=event.session;
+    setOwnerLinkSaving(true);
+    let success=false;
+    const operation=hardwareBindingWriteRef.current.catch(()=>undefined).then(async()=>{
+      const current=lampHardwareIdentityRef.current[node.id];
+      if(current?.session!==session || current.state!=='identified' || currentCloudUserRef.current!==uid)throw new Error('Lamp connection or account changed. Retry the association.');
+      const verified=await portalClient.confirmHardwareBinding(current.hardwareUid!,target,current.deviceType!);
+      if(lampHardwareIdentityRef.current[node.id]?.session!==session||currentCloudUserRef.current!==uid)throw new Error('Connection/account changed while confirming binding');
+      if(verified.binding.hardwareUid!==current.hardwareUid||verified.binding.arcDeviceId!==target||verified.device.type!==current.deviceType||!verified.device.access.isOwner||verified.device.owner.uid!==uid)throw new Error('Factory binding or owner permission mismatch');
+      const authorized=[verified.device.id];
+      const next=associateHardwareBinding(hardwareBindingsRef.current,current.hardwareUid!,target,uid,authorized,canonicalDeviceForNode(node,portalDevices)?.id);
+      await AsyncStorage.setItem('arc:hardware-product-bindings:v1',JSON.stringify(next));
+      hardwareBindingsRef.current=next;setHardwareBindings(next);success=true;
+      setMeshStatus(`ARC identity linked — ${target}; device authorization remains separate`);
+    });
+    hardwareBindingWriteRef.current=operation;
+    try{await operation;return success;}catch(error:any){setMeshEditError(error.message ?? 'Could not persist hardware binding');return false;}finally{setOwnerLinkSaving(false);}
   };
 
-  const ownerLinkCandidates = ownerLinkSource && ownerLinksAccount === arcCloudSession.userId && !portalInventoryCached
-    ? ownerLinkTargets(ownerLinkSource, portalDevices, arcCloudSession.userId).filter(device =>
-        !Object.entries(activeOwnerLinks).some(([key, target]) =>
-          target === device.id && key !== ownerLinkKey(ownerLinkSource))) : [];
-  const ownerLinkExistingTarget = ownerLinkSource ? activeOwnerLinks[ownerLinkKey(ownerLinkSource)] ?? null : null;
-  const saveOwnerLink = async (target: string | null): Promise<boolean> => {
-    const uid = arcCloudSession.userId;
-    const node = ownerLinkSource;
-    if (!uid || !node || ownerLinksAccount !== uid || currentCloudUserRef.current !== uid || portalInventoryCached) {
-      setMeshEditError('Refresh your ARC account and device inventory before changing the association.');
-      return false;
-    }
-    const key = ownerLinkKey(node);
-    if (target && !ownerLinkCandidates.some(device => device.id === target)) {
-      setMeshEditError('Select an owned, unassigned ARC device of the matching type.');
-      return false;
-    }
-    const next: OwnerConfirmedDeviceLinks = { ...activeOwnerLinks };
-    if (target) next[key] = target;
-    else delete next[key];
-    if (target && validatedOwnerLinkId(node, portalDevices, next, uid) !== target) {
-      setMeshEditError('This association conflicts with an existing BLE/cloud device identity.');
-      return false;
-    }
-    setOwnerLinkSaving(true);
-    try {
-      // Removing/changing a mapping must not leave a previously connected BLE
-      // transport operating under an obsolete cloud identity.
-      if (node.connected && activeOwnerLinks[key] !== target) {
-        await mesh.disconnectNode(node.id);
-        setMeshNodes(prev => prev.map(n => n.id === node.id ? { ...n, connected: false } : n));
-      }
-      await AsyncStorage.setItem(`arc:owner-device-links:${uid}`, JSON.stringify(next));
-      if (currentCloudUserRef.current !== uid) return false;
-      setOwnerConfirmedLinks(next);
-      setOwnerLinkTargetId(target);
-      setOwnerLinkPickerOpen(false);
-      console.log(`[ArcIdentity][LOCAL_LINK] kind=${node.nodeKind} mac=${node.id} canonical=${target ?? 'unlinked'}`);
-      return true;
-    } catch {
-      setMeshEditError('Could not save the local association. No cloud records were changed.');
-      return false;
-    } finally {
-      setOwnerLinkSaving(false);
-    }
+  const ownerLinkSource = meshNodes.find(node => node.id === meshEditNodeId) ?? null;
+  const canConnectLocalNode = (node: MeshNode) => {
+    if(!['lamp','probe','gateway'].includes(node.nodeKind??''))return true;
+    return Boolean(localHardwareGrant(node)?.binding?.arcDeviceId===node.canonicalDeviceId&&localHardwareGrant(node)?.appAssociationCompleted);
   };
+
+  const ownerIdentity=ownerLinkSource?lampHardwareIdentity[ownerLinkSource.id]:undefined;
+  const ownerLinkCandidates=ownerIdentity?.state==='identified'&&!portalInventoryCached?portalDevices.filter(device=>
+    device.type===ownerIdentity.deviceType&&device.access.isOwner&&device.owner.uid===arcCloudSession.userId):[];
+  const ownerLinkExistingTarget=ownerIdentity?.hardwareUid?hardwareBindings.find(binding=>binding.hardwareUid===ownerIdentity.hardwareUid)?.arcDeviceId??null:null;
+  const saveOwnerLink = async (target: string | null): Promise<boolean> => saveIosHardwareBinding(target);;
 
   const localLampNodes = useMemo(
     () =>
@@ -1170,7 +1350,7 @@ function ArcApp() {
         }),
     [meshNodes]
   );
-  const lampNodes = useMemo(() => canonicalDeviceNodes(applyOwnerConfirmedDeviceLinks(localLampNodes, portalDevices, activeOwnerLinks, arcCloudSession.userId), portalDevices, 'lamp', knownCanonicalDeviceIdsRef.current), [localLampNodes, portalDevices, activeOwnerLinks, arcCloudSession.userId]);
+  const lampNodes = useMemo(() => canonicalDeviceNodes(applyOwnerConfirmedDeviceLinks(resolvedIosLampNodes ?? localLampNodes, portalDevices, activeOwnerLinks, arcCloudSession.userId), portalDevices, 'lamp', knownCanonicalDeviceIdsRef.current), [localLampNodes, portalDevices, activeOwnerLinks, arcCloudSession.userId, resolvedIosLampNodes]);
   const selectedLampNode = lampNodes.find((node) => node.id === selectedLampId) ?? null;
   const selectedLampName = selectedLampNode?.name ?? t('lamp.noSelected');
   // A local BLE MAC and a cloud UUID may have the same human-readable name
@@ -1267,8 +1447,9 @@ function ArcApp() {
   const selectedLampViewRef = useRef(selectedLampView);
   selectedLampViewRef.current = selectedLampView;
   const activeStatus = meshEnabled ? selectedLampView.lampStatus : lampStatus;
-  const canControlLamp = meshEnabled ? selectedLampView.canControl : connected;
-  const canConfigureLamp = meshEnabled ? selectedLampView.canEditSettings : connected;
+  const iosLampIdentityReady=Platform.OS!=='ios' || !meshEnabled || (selectedLampNode && iosHardwareResolution(selectedLampNode).state==='known');
+  const canControlLamp = meshEnabled ? Boolean(selectedLampNode?.connected&&localHardwareGrant(selectedLampNode)?.device?.access.canControl&&iosLampIdentityReady) : false;
+  const canConfigureLamp = meshEnabled ? Boolean(selectedLampNode?.connected&&localHardwareGrant(selectedLampNode)?.device?.access.canEditSettings&&iosLampIdentityReady) : false;
   const [lampCadenceById, setLampCadenceById] = useState<Record<string, LampCadenceReply>>({});
   const [lampCadenceDraftById, setLampCadenceDraftById] = useState<Record<string, number>>({});
   const [lampCadenceBusyById, setLampCadenceBusyById] = useState<Record<string, boolean>>({});
@@ -2071,10 +2252,46 @@ function ArcApp() {
     }
   };
 
+  const syncProbeTime = async (nodeId: string) => {
+    const node = meshNodesRef.current.find(candidate => candidate.id === nodeId);
+    if (!node || node.nodeKind !== 'probe' || !node.connected ||
+        lampHardwareIdentityRef.current[nodeId]?.state !== 'identified' ||
+        lampHardwareIdentityRef.current[nodeId]?.deviceType !== 'probe' ||
+        node.assignedGatewayId || node.assignedBridgeId) return;
+
+    const generation = probeTimeGenerationRef.current[nodeId] ?? 0;
+    if (probeTimeSentGenerationRef.current[nodeId] === generation ||
+        probeTimeInFlightRef.current[nodeId]) return;
+    const now = Date.now();
+    if (now - (probeTimeLastAttemptRef.current[nodeId] ?? 0) < TIME_SYNC_RETRY_BACKOFF_MS) return;
+
+    probeTimeLastAttemptRef.current[nodeId] = now;
+    probeTimeInFlightRef.current[nodeId] = true;
+    try {
+      const epochSeconds = Math.floor(Date.now() / 1000);
+      const ack = await mesh.setProbeTimeEpoch(nodeId, epochSeconds);
+      // Only a matching application-level firmware ACK confirms synchronization.
+      if ((probeTimeGenerationRef.current[nodeId] ?? 0) !== generation) return;
+      probeTimeSentGenerationRef.current[nodeId] = generation;
+      addMeshLog(ack
+        ? `[ProbeTimeSync][ACK_CONFIRMED] probe=${nodeId} unix=${ack.epochSeconds} nonce=${ack.nonce}`
+        : `[ProbeTimeSync][TX_OK_NOT_CONFIRMED] probe=${nodeId} unix=${epochSeconds}`,nodeId);
+    } catch (error: any) {
+      if ((probeTimeGenerationRef.current[nodeId] ?? 0) === generation) {
+        addMeshLog(`[ProbeTimeSync][FAIL] probe=${nodeId} error=${error?.message ?? String(error)}`, nodeId);
+      }
+    } finally {
+      // Do not let an old write clear a newer connection's in-flight guard.
+      if ((probeTimeGenerationRef.current[nodeId] ?? 0) === generation) {
+        probeTimeInFlightRef.current[nodeId] = false;
+      }
+    }
+  };
+
   // Initial UTC synchronization is independent of schedule configuration.
   // Preserve the existing settings permission and confirmation path.
   useEffect(() => {
-    if (!activeConnected || !canConfigureLamp || (meshEnabled && portalInventoryCached)) return;
+    if (!activeConnected || !canConfigureLamp) return;
     const key = meshEnabled ? selectedLampNode?.id : selectedDeviceId;
     if (key) void syncLampTime(key);
   }, [activeConnected, canConfigureLamp, meshEnabled, portalInventoryCached,
@@ -2562,8 +2779,8 @@ function ArcApp() {
   // manual; a later app launch retries automatically.
   useEffect(() => {
     if (Platform.OS !== 'android' || !meshEnabled || !mesh.isAvailable || !meshTransportReady ||
-        !arcCloudSession.userId || ownerLinksAccount !== arcCloudSession.userId || portalInventoryCached) return;
-    const candidates = meshNodes.filter(node => isCurrentArcLamp(node) && !node.connected && canConnectLocalNode(node));
+        !arcCloudSession.userId || ownerLinksAccount !== arcCloudSession.userId) return;
+    const candidates = meshNodes.filter(node => isCurrentArcLamp(node) && !node.connected && Boolean(node.canonicalDeviceId&&portalDevices.some(device=>device.id===node.canonicalDeviceId)));
     const selected = candidates.find(node => node.id === selectedLampId) ?? candidates[0];
     if (!selected) return;
     const key = `${arcCloudSession.userId}:${ownerLinkKey(selected)}`;
@@ -2728,6 +2945,12 @@ function ArcApp() {
       // is in standalone/direct mode. That is direct Probe telemetry, not a
       // gateway frame whose bridge ID needs matching to another node.
       if (bridge?.nodeKind === 'probe') {
+        // The first admitted Direct BLE telemetry provides the send opportunity.
+        // In-flight and connection-generation guards prevent per-second resends.
+        if (!bridge.assignedGatewayId && !bridge.assignedBridgeId) {
+          if(probeStatus.sampleTimePresent&&probeStatus.timestampValid===false)delete probeTimeSentGenerationRef.current[bridgeNodeId];
+          void syncProbeTime(bridgeNodeId);
+        }
         console.log(`[ProbeDirect][0x51][APPLY] probe=${bridgeNodeId}`);
         setMeshNodes((prev) => prev.map((node) =>
           node.id === bridgeNodeId
@@ -2772,6 +2995,12 @@ function ArcApp() {
           `[ProbeRoute][TELEMETRY][UNMATCHED] bridge=${bridgeNodeId} kind=${bridge.nodeKind} explicit=${explicitlyAssigned.length}`
         );
         return;
+      }
+      if(probeStatus.sampleTimePresent){
+        const binding=hardwareBindingsRef.current.find(item=>item.hardwareUid===probeStatus.sampleHardwareUid);
+        if(!binding||binding.arcDeviceId!==(matchedProbe.canonicalDeviceId??matchedProbe.id)){
+          console.log(`[ProbeSampleTime][SOURCE_MISMATCH] bridge=${bridgeNodeId}`);return;
+        }
       }
       const route = bridge.nodeKind === 'gateway' ? 'viaGateway' as const : 'viaLamp' as const;
       console.log(`[ProbeRoute][TELEMETRY][APPLY] bridge=${bridgeNodeId} probe=${matchedProbe.id} route=${route}`);
@@ -3198,6 +3427,7 @@ function ArcApp() {
           ? Object.freeze({ owner: 'PRODUCTION', leaseId: historyOwner.leaseId, phaseGeneration: historyRequestPhases.get(lampId)?.capture(null).generation })
           : Object.freeze({ owner: 'NONE' }),
       onStatus: (lampId, historyStatus, context) => {
+        if(Platform.OS==='ios' && historyStatus.ready)setArcHistoryGeneration(lampId,historyStatus.journalGeneration);
         if (context?.owner === 'DEBUG_MAILBOX') { debugMailbox.onStatus(lampId, historyStatus, context.debugRunId); return; }
         if (context?.owner === 'NONE' || historyOwner.isDebug(lampId)) return;
         queueHistoryWork(lampId, async () => {
@@ -3218,7 +3448,7 @@ function ArcApp() {
         const avoidUnverifiedCloudCoverage = Boolean(epochSuspect && epochSuspect.userId === userId &&
           epochSuspect.cloudHead > historyStatus.newestSequence);
         const recovery = await resolveHistoryRecovery(historyStatus, local,
-          cloudEnabled && Boolean(canonical) && !avoidUnverifiedCloudCoverage,
+          historyStatus.recordVersion !== 3 && cloudEnabled && Boolean(canonical) && !avoidUnverifiedCloudCoverage,
           () => portalClient.historyCoverage(canonical!.id, historyStatus.oldestSequence, historyStatus.newestSequence), canonical?.id);
         const { coverage, coverageError } = recovery;
         let plan = recovery.plan;
@@ -3281,7 +3511,7 @@ function ArcApp() {
         const hintDevice = hint ? historyDevice(inventory.devices, hint.probeId, 'probe') : null;
         const blockedIndex = historyIdentityBlocks.get(lampId)?.probeIndex;
         const canWitnessIdentity = Boolean(
-          historyStatus.mappingCount > 1 &&
+          historyStatus.recordVersion !== 3 && historyStatus.mappingCount > 1 &&
           hint &&
           Date.now() - hint.seenAt <= 15_000 &&
           assignedProbes.length === 1 &&
@@ -3455,26 +3685,29 @@ function ArcApp() {
         const receivedAtMs = Date.now();
         addMeshLog(`[HistorySync][RX] lamp=${lampId} seq=${record.sequence} type=${record.recordType} schema=${record.schemaVersion} ts=${record.unixTimeSeconds} tsValid=${record.timestampValid ? 1 : 0}`, lampId);
         if (record.recordType === 'probe_environment') {
+          const sourceBinding=record.schemaVersion===3?resolveHardwareBinding(hardwareBindingsRef.current,record.sourceHardwareUid):{state:'unknown' as const};
           const assignedProbes = meshNodesRef.current.filter(
             (node) => node.nodeKind === 'probe' && node.provisioned && node.assignedBridgeId === lampId
           );
           const registeredProbe = registeredProbeForHistoryIndex(inventory.devices, lampId, record.probeIndex);
           const witnessedProbeId = historyProbeBindings.get(lampId)?.get(record.probeIndex) ?? null;
-          const probeId = registeredProbe?.id ?? witnessedProbeId ?? (
+          const legacyProbeId = registeredProbe?.id ?? witnessedProbeId ?? (
             assignedProbes.length === 1 && drain.mappingCount === 1 && record.probeIndex === 0
               ? assignedProbes[0].id
               : `lamp-history:${lampId}:probe-${record.probeIndex}`
           );
           // Conflicting registered and witnessed identities must fail closed.
-          const conflictingSources = Boolean(registeredProbe && witnessedProbeId && registeredProbe.id !==
+          const legacyConflictingSources = Boolean(registeredProbe && witnessedProbeId && registeredProbe.id !==
             (historyDevice(inventory.devices, witnessedProbeId, 'probe')?.id ?? witnessedProbeId));
+          const probeId=record.schemaVersion===3?(sourceBinding.state==='known'?sourceBinding.arcDeviceId:`hardware:${record.sourceHardwareUid}`):legacyProbeId;
+          const conflictingSources=record.schemaVersion===3?sourceBinding.state==='conflict':legacyConflictingSources;
           if (conflictingSources || !historyDevice(inventory.devices, probeId, 'probe')?.access.canViewHistory) {
             historyIdentityBlocks.set(lampId, {
               accountUid: drain.userId,
               probeIndex: record.probeIndex,
               lastHintSeenAt: routedHistoryHints.get(lampId)?.seenAt ?? 0,
               probeIntervalMs: Math.max(60_000, (drain.probeIntervalSeconds ?? 300) * 1000),
-              conflictingRegisteredId: conflictingSources ? registeredProbe?.id : null,
+              conflictingRegisteredId: conflictingSources ? probeId : null,
               conflictingWitnessedId: conflictingSources ? witnessedProbeId : null,
             });
             stopHistoryDrain(lampId);
@@ -3484,11 +3717,12 @@ function ArcApp() {
           const snapshot = arcHistoryRecordToProbeStatus(record);
           await appendProbeLogRecord({
             probeId,
-            recordId: `lamp:${lampId}:history:${record.sequence}`,
-            deviceTimestampMs: record.timestampValid ? record.unixTimeSeconds * 1000 : null,
+            recordId:hardwareHistoryRecordId(record,lampId),
+            hardwareProvenance:hardwareHistoryProvenance(record),
+            deviceTimestampMs: record.schemaVersion===3?(record.measurementTimestampValid?record.measurementUnixTimeSeconds*1000+record.measurementMilliseconds:null):(record.timestampValid?record.unixTimeSeconds*1000:null),
             receivedAtMs,
-            timestampValid: record.timestampValid,
-            timestampOrigin: record.timestampValid ? 'lamp_g4_receive_rtc' : 'unknown',
+            timestampValid: record.schemaVersion===3?record.measurementTimestampValid:record.timestampValid,
+            timestampOrigin:record.schemaVersion===3?(record.measurementTimestampValid?'probe_device':'unknown'):(record.timestampValid?'lamp_g4_receive_rtc':'unknown'),
             source: snapshot.source ?? null,
             syncMode: settings.syncMode,
             snapshot,
@@ -3617,6 +3851,13 @@ function ArcApp() {
         setMeshStatus(isConnected ? 'Connected' : 'Disconnected');
       }
       if (!isConnected) {
+        if (node?.nodeKind === 'probe') {
+          probeTimeGenerationRef.current[nodeId] = (probeTimeGenerationRef.current[nodeId] ?? 0) + 1;
+          probeTimeInFlightRef.current[nodeId] = false;
+          delete probeTimeSentGenerationRef.current[nodeId];
+          delete probeTimeLastAttemptRef.current[nodeId];
+          setProbeSampleConfirmedById(prev => {const next={...prev};delete next[nodeId];return next;});
+        }
         clearHistoryStatusTimeout(nodeId);
         historyStarts.delete(nodeId);
         const drain = historyDrains.get(nodeId);
@@ -3988,7 +4229,7 @@ function ArcApp() {
     let cancelled = false;
     void loadCloudSyncEnabled().then((enabled) => {
       if (cancelled) return;
-      setCloudSyncEnabled(enabled);
+      setCloudSyncEnabled(ARC_CLOUD_SYNC_VALIDATION_HOLD ? false : enabled);
       setCloudSyncPreferenceReady(true);
     });
     void refreshLocalTelemetryStats();
@@ -4005,7 +4246,7 @@ function ArcApp() {
   }, [cloudSyncEnabled, cloudSyncPreferenceReady]);
 
   useEffect(() => {
-    if (!cloudSyncPreferenceReady || !cloudSyncEnabled) {
+    if (ARC_CLOUD_SYNC_VALIDATION_HOLD || !cloudSyncPreferenceReady || !cloudSyncEnabled) {
       setCloudSyncState('idle');
       return;
     }
@@ -4026,10 +4267,10 @@ function ArcApp() {
       try {
         const result = await drainCloudTelemetry(async (records) => {
           if (cancelled || currentCloudUserRef.current !== arcCloudSession.userId) throw new Error('Gateway account changed');
-          const prepared = records.map(record => prepareHistoryUpload(record, historyInventoryRef.current.devices));
+          const prepared = records.map(record => prepareHistoryUpload(record, historyInventoryRef.current.devices, hardwareBindingsRef.current, arcCloudSession.userId));
           if (prepared.some(record => !record)) throw new Error('History grant or canonical device mapping unavailable');
           return uploadArcCloudTelemetryBatch(arcCloudSession.orgId, prepared.filter((record): record is NonNullable<typeof record> => record !== null));
-        }, record => historyInventoryRef.current.userId === arcCloudSession.userId && Boolean(prepareHistoryUpload(record, historyInventoryRef.current.devices)));
+        }, record => historyInventoryRef.current.userId === arcCloudSession.userId && Boolean(prepareHistoryUpload(record, historyInventoryRef.current.devices, hardwareBindingsRef.current, arcCloudSession.userId)));
         const stats = await loadLocalTelemetryStats();
         if (cancelled) return;
         setLocalTelemetryStats(stats);
@@ -4252,6 +4493,8 @@ function ArcApp() {
     }
     setStatus('Connecting...');
     log('connect pressed', { selectedDeviceId, platform: Platform.OS });
+    const arcNode=meshNodes.find(node=>node.id===selectedDeviceId&&!isLegacyMeshNode(node));
+    if(arcNode){await connectMeshNode(arcNode);return;}
     try {
       if (selectedDeviceId) {
         await ble.connectTo(selectedDeviceId);
@@ -4280,7 +4523,7 @@ function ArcApp() {
   };
 
   const openMeshEdit = (node: MeshNode) => {
-    setOwnerLinkTargetId(activeOwnerLinks[ownerLinkKey(node)] ?? null);
+    setOwnerLinkTargetId(hardwareBindings.find(binding=>binding.hardwareUid===lampHardwareIdentity[node.id]?.hardwareUid)?.arcDeviceId ?? null);
     setOwnerLinkPickerOpen(false);
     setMeshSelectedNodeId(node.id);
     setMeshEditNodeId(node.id);
@@ -4306,10 +4549,8 @@ function ArcApp() {
       return;
     }
     const editingNode = meshNodes.find(node => node.id === meshEditNodeId);
-    if (Platform.OS === 'android' && editingNode &&
-        (editingNode.nodeKind === 'lamp' || editingNode.nodeKind === 'probe') &&
-        ownerLinkTargetId !== (activeOwnerLinks[ownerLinkKey(editingNode)] ?? null)) {
-      if (!await saveOwnerLink(ownerLinkTargetId)) return;
+    if(editingNode&&['lamp','probe'].includes(editingNode.nodeKind??'')&&ownerLinkTargetId!==ownerLinkExistingTarget){
+      if(!await saveOwnerLink(ownerLinkTargetId))return;
     }
     const abbreviation = meshEditAbbrev.trim() || buildMeshAbbrev(name);
     setMeshNodes((prev) =>
@@ -4354,11 +4595,7 @@ function ArcApp() {
   };
 
   const connectMeshNode = async (node: MeshNode) => {
-    if (!canConnectLocalNode(node)) {
-      setMeshStatus('Select and save a claimed ARC ID in this node’s Settings before connecting.');
-      openMeshEdit(node);
-      return false;
-    }
+    // Public identity reads must precede association. Control stays gated separately.
     if (!mesh.isAvailable) {
       setMeshStatus('ARC native transport module not available.');
       return false;
@@ -4431,20 +4668,17 @@ function ArcApp() {
   };
 
   const authorizeLampCommand = async (permission: 'canControl' | 'canEditSettings') => {
-    if (!meshEnabled) return connected;
-    const view = selectedLampViewRef.current;
-    if (!currentCloudUserRef.current || !view.node || !isCurrentArcLamp(view.node) || !view.node.connected || (view.device && portalInventoryCached)) return false;
-    const requestedUserId = currentCloudUserRef.current;
-    if (!view.device) return Boolean(view.node.provisioned && !knownCanonicalDeviceIdsRef.current.has(view.node.id)); // Existing local commissioning path.
-    try {
-      const current = await portalClient.device(view.device.id);
-      if (currentCloudUserRef.current !== requestedUserId || selectedLampViewRef.current.node?.id !== view.node.id || !selectedLampViewRef.current.node.connected) return false;
-      setPortalDevices(previous => previous.map(device => device.id === current.id ? current : device));
-      return current.access[permission];
-    } catch (error) {
-      setStatus(portalErrorMessage(error));
-      return false;
-    }
+    if(!meshEnabled){setStatus('This legacy BLE path cannot verify ARC hardware permissions');return false;}
+    const view=selectedLampViewRef.current,subject=currentCloudUserRef.current;
+    const grant=localHardwareGrant(view.node);
+    if(!subject||!view.node?.connected||!isCurrentArcLamp(view.node)||!grant?.binding||grant.binding.deviceType!=='lamp')return false;
+    const identity=lampHardwareIdentityRef.current[view.node.id];
+    if(identity?.state!=='identified'||identity.session!==grant.session||identity.hardwareUid!==grant.binding.hardwareUid)return false;
+    try{
+      const local=await nativeOfflineAccess.read(subject,grant.binding.hardwareUid);
+      if(!local||local.binding.deviceType!=='lamp'||local.binding.arcDeviceId!==view.device?.id||lampHardwareIdentityRef.current[view.node.id]?.session!==grant.session||currentCloudUserRef.current!==subject||selectedLampViewRef.current.node?.id!==view.node.id||!selectedLampViewRef.current.node.connected)return false;
+      return local.device.access[permission];
+    }catch(error){setStatus(String(error));return false;}
   };
 
   const handlePowerToggle = async (value: boolean) => {
@@ -5445,7 +5679,8 @@ function ArcApp() {
   };
 
   const updateSelectedProbeDesiredSettings = (patch: Partial<ProbeSettings['desiredProbeSettings']>) => {
-    if (!selectedProbeView.canEditSettings) return;
+    if (!selectedProbeView.canEditSettings &&
+        !(selectedProbeNode && localHardwareGrant(selectedProbeNode)?.device?.access.canEditSettings)) return;
     updateSelectedProbeSettings((settings) => ({
       ...settings,
       desiredProbeSettings: {
@@ -5934,10 +6169,44 @@ function ArcApp() {
     </Modal>
   );
 
+  const applySelectedProbeSampleInterval = async () => {
+    const node = selectedProbeNode;
+    const desired = selectedProbeSettings?.desiredProbeSettings.regularMeasurementIntervalSec;
+    const grant = node ? localHardwareGrant(node) : undefined;
+    if (!node || !node.connected || node.nodeKind !== 'probe' ||
+        node.assignedGatewayId || node.assignedBridgeId ||
+        lampHardwareIdentityRef.current[node.id]?.state !== 'identified' ||
+        lampHardwareIdentityRef.current[node.id]?.deviceType !== 'probe' ||
+        !grant?.device?.access.canEditSettings || Platform.OS !== 'ios' ||
+        typeof desired !== 'number' || probeSampleBusyById[node.id]) return;
+    const nodeId = node.id;
+    const expectedSession = lampHardwareIdentityRef.current[nodeId]?.session;
+    setProbeSampleBusyById(prev => ({...prev,[nodeId]:true}));
+    setProbeSampleErrorById(prev => ({...prev,[nodeId]:''}));
+    updateSelectedProbeDesiredSettings({commandState:'pending'});
+    try {
+      const reply = await mesh.setProbeSampleInterval(nodeId,desired);
+      if (lampHardwareIdentityRef.current[nodeId]?.session !== expectedSession ||
+          !meshNodesRef.current.some(n => n.id===nodeId && n.connected))
+        throw new Error('Probe connection changed during Apply');
+      setProbeSampleConfirmedById(prev => ({...prev,[nodeId]:reply.activeSeconds}));
+      updateSelectedProbeDesiredSettings({commandState:'applied'});
+      addMeshLog(`[ProbeSample][ACK_CONFIRMED] probe=${nodeId} active=${reply.activeSeconds}s persisted=${reply.persisted ? 1 : 0}`,nodeId);
+    } catch(error:any) {
+      updateSelectedProbeDesiredSettings({commandState:'failed'});
+      const reason=String(error?.message ?? error);
+      setProbeSampleErrorById(prev => ({...prev,[nodeId]:reason}));
+      addMeshLog(`[ProbeSample][FAIL] probe=${nodeId} reason=${reason}`,nodeId);
+    } finally {
+      setProbeSampleBusyById(prev => ({...prev,[nodeId]:false}));
+    }
+  };
+
   const setSelectedProbeRegularInterval = (regularMeasurementIntervalSec: number) => {
     updateSelectedProbeDesiredSettings({
       powerProfile: 'custom',
       regularMeasurementIntervalSec,
+      commandState: 'local_only',
     });
   };
 
@@ -6376,7 +6645,7 @@ function ArcApp() {
     const cadence = lampCadenceById[cadenceId];
     const cadenceBusy = Boolean(lampCadenceBusyById[cadenceId]);
     const cadenceRead = Boolean(lampCadenceReadById[cadenceId] && selectedLampNode?.connected);
-    const cadenceEditable = Boolean(meshEnabled && selectedLampNode?.connected && canConfigureLamp && !portalInventoryCached && cadenceRead && !cadenceBusy);
+    const cadenceEditable = Boolean(meshEnabled && selectedLampNode?.connected && canConfigureLamp && cadenceRead && !cadenceBusy);
     const cadenceSeconds = cadenceRead ? lampCadenceDraftById[cadenceId] ?? cadence?.seconds ?? 300 : cadence?.seconds ?? 300;
     const cadenceIndex = Math.max(0, LAMP_TELEMETRY_INTERVALS.indexOf(cadenceSeconds));
     const setCadenceIndex = (index: number) => { if (cadenceEditable) setLampCadenceDraftById(prev => ({ ...prev, [cadenceId]: LAMP_TELEMETRY_INTERVALS[Math.max(0, Math.min(9, index))] })); };
@@ -7290,6 +7559,7 @@ function ArcApp() {
       if (currentCloudUserRef.current !== userId) return;
       portalInventorySourceRef.current = 'network';
       historyAccessUserRef.current = currentCloudUserRef.current;
+      void narrowOfflinePermissions(devices,userId);
       setPortalDevices(previous => {
         const merged = mergePortalInventory(previous, devices);
         void savePortalDevicePresentationCache(userId, merged).catch(() => undefined);
@@ -7301,6 +7571,14 @@ function ArcApp() {
       // Keep last-known presentation, but an unavailable authority cannot authorize commands.
       if (currentCloudUserRef.current === userId) setPortalInventoryCached(true);
     }
+  }
+
+  async function narrowOfflinePermissions(devices:PortalDeviceSummary[],subject:string){
+    if(currentCloudUserRef.current!==subject)return;
+    try{const affected=await nativeOfflineAccess.narrowFromFreshInventory(subject,devices);
+      if(currentCloudUserRef.current!==subject)return;
+      for(const state of hardwareOnboarding.snapshot())if(state.binding&&affected.includes(state.binding.hardwareUid)){void hardwareOnboarding.retry(state.nodeId);}
+    }catch(error){setMeshStatus(`Local permission reconciliation failed: ${String(error)}`);}
   }
 
   async function refreshPortalWorkspace() {
@@ -7322,6 +7600,7 @@ function ArcApp() {
     if (devicesResult.status === 'fulfilled') {
       portalInventorySourceRef.current = 'network';
       historyAccessUserRef.current = currentCloudUserRef.current;
+      void narrowOfflinePermissions(devicesResult.value,requestedUserId!);
       setPortalDevices(previous => mergePortalInventory(previous, devicesResult.value));
       setPortalDevicesCachedAt(Date.now());
       setPortalInventoryCached(false);
@@ -7401,13 +7680,6 @@ function ArcApp() {
     if (windowKey === '6h') return 6 * 60 * 60 * 1000;
     if (windowKey === '24h') return 24 * 60 * 60 * 1000;
     return 60 * 60 * 1000;
-  };
-
-  const getProbeGraphTimestamp = (record: ProbeLogEnvelope) => {
-    const edgeTimestamp = record.timeline.deviceTimestampMs;
-    return typeof edgeTimestamp === 'number' && Number.isFinite(edgeTimestamp)
-      ? edgeTimestamp
-      : record.timeline.receivedAtMs;
   };
 
   const getLampGraphTimestamp = (record: LampOperationalRecord) => {
@@ -7894,11 +8166,11 @@ function ArcApp() {
 
     const now = snapshot.updatedAt ?? Date.now();
     const lastLoggedAt = probeLastLoggedAtByIdRef.current[probeId] ?? 0;
-    if (now - lastLoggedAt < settings.loggingIntervalSec * 1000) {
+    if (now - lastLoggedAt < settings.loggingIntervalSec * 1000 && !(snapshot.timestampValid===true&&probeLastLoggedHasDeviceTimeRef.current[probeId]!==true)) {
       return;
     }
 
-    probeLastLoggedAtByIdRef.current[probeId] = now;
+
 
     void appendProbeLogRecord({
       probeId,
@@ -7914,6 +8186,8 @@ function ArcApp() {
       storageBudgetMb: settings.storageBudgetMb,
     })
       .then(() => {
+        probeLastLoggedAtByIdRef.current[probeId] = now;
+        probeLastLoggedHasDeviceTimeRef.current[probeId] = snapshot.timestampValid===true;
         addMeshLog(`[ProbeLog][LOCAL_OK] probe=${probeId} receivedAtMs=${now}`, probeId);
         if (probeLoggingViewsOpenRef.current) {
           void refreshProbeLoggingStats();
@@ -8147,6 +8421,7 @@ function ArcApp() {
                   <ManualStepButton
                     direction="minus"
                     appStyles={styles}
+                    disabled={Boolean(probeSampleBusyById[probeNode.id])}
                     label="Sample more often"
                     onPress={() => {
                       const nextIndex = Math.max(selectedProbeSampleIntervalIndex - 1, 0);
@@ -8159,6 +8434,7 @@ function ArcApp() {
                   <ManualStepButton
                     direction="plus"
                     appStyles={styles}
+                    disabled={Boolean(probeSampleBusyById[probeNode.id])}
                     label="Sample less often"
                     onPress={() => {
                       const nextIndex = Math.min(selectedProbeSampleIntervalIndex + 1, regularIntervalOptions.length - 1);
@@ -8172,6 +8448,7 @@ function ArcApp() {
                 value={selectedProbeSampleIntervalIndex}
                 minimum={0}
                 maximum={regularIntervalOptions.length - 1}
+                disabled={Boolean(probeSampleBusyById[probeNode.id])}
                 colors={['#9fc9ad', '#3f7f57']}
                 onChange={(index) => setSelectedProbeRegularInterval(regularIntervalOptions[index])}
               />
@@ -8179,6 +8456,27 @@ function ArcApp() {
                 <Text style={styles.manualGroupHint}>{t('probe.moreSamples')}</Text>
                 <Text style={styles.manualGroupHint}>{t('probe.longerBattery')}</Text>
               </View>
+              <Text style={styles.manualGroupHint}>
+                {`Device: ${formatProbeInterval(probeSampleConfirmedById[probeNode.id] ?? probeNode.probeStatus?.regularSampleIntervalS)} · prototype change lasts until reboot`}
+              </Text>
+              {probeSampleErrorById[probeNode.id] ? <Text style={styles.muted}>{probeSampleErrorById[probeNode.id]}</Text> : null}
+              <TouchableOpacity
+                style={[styles.buttonSecondary, (probeSampleBusyById[probeNode.id] ||
+                  !probeNode.connected || Platform.OS !== 'ios' ||
+                  !localHardwareGrant(probeNode)?.device?.access.canEditSettings ||
+                  lampHardwareIdentity[probeNode.id]?.state !== 'identified' ||
+                  probeNode.assignedGatewayId || probeNode.assignedBridgeId ||
+                  selectedProbeSampleIntervalSec === (probeSampleConfirmedById[probeNode.id] ?? probeNode.probeStatus?.regularSampleIntervalS)) && styles.headerActionButtonDisabled]}
+                disabled={Boolean(probeSampleBusyById[probeNode.id] ||
+                  !probeNode.connected || Platform.OS !== 'ios' ||
+                  !localHardwareGrant(probeNode)?.device?.access.canEditSettings ||
+                  lampHardwareIdentity[probeNode.id]?.state !== 'identified' ||
+                  probeNode.assignedGatewayId || probeNode.assignedBridgeId ||
+                  selectedProbeSampleIntervalSec === (probeSampleConfirmedById[probeNode.id] ?? probeNode.probeStatus?.regularSampleIntervalS))}
+                onPress={() => void applySelectedProbeSampleInterval()}
+              >
+                <Text style={styles.buttonTextLight}>{probeSampleBusyById[probeNode.id] ? 'Applying…' : 'Apply Sample Time'}</Text>
+              </TouchableOpacity>
             </View>
           </View>
         ) : null}
@@ -8438,18 +8736,10 @@ function ArcApp() {
       }
     }
 
-    if (Platform.OS === 'android' && !item.connected &&
-        (isLamp || isProbe) && !canConnectLocalNode(item)) {
-      actionLabel = 'Select ARC ID';
-      actionHandler = () => openMeshEdit(item);
-      actionDisabled = meshConnecting || meshScanning;
-      actionStyle = styles.buttonSecondary;
-      actionPrimary = false;
-    }
 
     return (
       <TouchableOpacity
-        style={[styles.meshTile, windowWidth >= 600 && styles.meshTileTwoColumn, selected && styles.meshTileSelected]}
+        style={[styles.meshTile, Platform.OS === 'android' && localNodeColumns(Platform.OS, windowWidth) === 2 && styles.meshTileTwoColumn, selected && styles.meshTileSelected]}
         onPress={() => setMeshSelectedNodeId(item.id)}
       >
         <View style={styles.meshTileHeader}>
@@ -8468,11 +8758,11 @@ function ArcApp() {
             </Text>
             {isProbe ? (
               <Text style={styles.meshTileSubtitle} numberOfLines={1} ellipsizeMode="tail">
-                {tileRouteLabel}
+                {Platform.OS === 'ios' ? formatProbeRouteLabel(item, assignedGateway, assignedLamp) : tileRouteLabel}
               </Text>
             ) : null}
             {!item.provisioned && <Text style={styles.meshTileSubtitle} numberOfLines={1}>{t('comms.new')}</Text>}
-            {/* The full UUID is available in node settings, not in the fixed-height tile. */}
+            {Platform.OS === 'ios' && !item.provisioned && item.uuid ? <Text style={styles.meshTileSubtitle} numberOfLines={1}>{item.uuid}</Text> : null}
           </View>
           <TouchableOpacity
             style={styles.meshTileGear}
@@ -8527,7 +8817,7 @@ function ArcApp() {
   const renderMeshComms = () => {
     const title = threadEnabled ? 'Thread Connections' : 'ARC Connections';
     // FlatList requires a new key when numColumns changes after a rotation.
-    const tileColumns = windowWidth >= 600 ? 2 : 1;
+    const tileColumns = localNodeColumns(Platform.OS, windowWidth);
     const sortedNodes = meshNodes.filter(node => !isLegacyMeshNode(node)).sort((a, b) => {
       if (a.connected !== b.connected) return a.connected ? -1 : 1;
       if (a.provisioned !== b.provisioned) return a.provisioned ? -1 : 1;
@@ -9560,6 +9850,16 @@ function ArcApp() {
             {portalError ? <Text style={styles.portalWarningText}>{portalError}</Text> : null}
             {portalActionMessage ? <Text style={styles.portalSuccessText}>{portalActionMessage}</Text> : null}
           </View>
+          {Platform.OS === 'ios' ? (
+            <TouchableOpacity
+              style={styles.portalRefreshButton}
+              onPress={() => { iosDeviceQrStagedScanRef.current = null; setIosDeviceQrReview(null); setIosDeviceQrScannerOpen(true); }}
+              accessibilityRole="button"
+              accessibilityLabel="Add device by scanning ARC QR code"
+            >
+              <Text style={styles.portalTextAction}>+ Scan QR</Text>
+            </TouchableOpacity>
+          ) : null}
           <TouchableOpacity style={styles.portalRefreshButton} onPress={() => void refreshPortalWorkspace()} disabled={portalLoading}>
             <Text style={styles.portalTextAction}>{portalLoading ? t('connections.refreshing') : t('connections.refresh')}</Text>
           </TouchableOpacity>
@@ -10462,7 +10762,7 @@ function ArcApp() {
       : regularIntervalOptions.reduce((bestIndex, seconds, index) =>
           Math.abs(seconds - selectedProbeSampleIntervalSec) < Math.abs(regularIntervalOptions[bestIndex] - selectedProbeSampleIntervalSec) ? index : bestIndex, 0)
   );
-  const selectedProbeSampleSettingStatus = selectedProbeSettings?.desiredProbeSettings.commandState === 'applied'
+  const selectedProbeSampleSettingStatus = probeSampleConfirmedById[selectedProbeNode?.id ?? ''] === selectedProbeSampleIntervalSec
     ? t('probe.confirmed')
     : selectedProbeSettings?.desiredProbeSettings.commandState === 'unsupported'
       ? t('probe.pendingSupport')
@@ -10804,10 +11104,7 @@ function ArcApp() {
       : [],
     [graphDataReady, selectedLampNode?.id, selectedLampNode?.connected, selectedLampView.device, canReadLampHistory, recentLampLogs, cloudLampLogs, cloudSyncEnabled, portalDevices]
   );
-  const probeGraphRecordsWithoutEdgeTime = graphSourceLogs.filter((record) =>
-    typeof record.timeline.deviceTimestampMs !== 'number' ||
-    !Number.isFinite(record.timeline.deviceTimestampMs)
-  ).length;
+  const probeGraphRecordsWithoutEdgeTime = graphSourceLogs.filter(record=>probeRecordedTimestamp(record)===null).length;
   const lampGraphRecordsWithoutEdgeTime = selectedLampGraphSourceLogs.filter((record) =>
     typeof record.timeline.lampSampledAtMs !== 'number' ||
     !Number.isFinite(record.timeline.lampSampledAtMs)
@@ -10817,14 +11114,7 @@ function ArcApp() {
   // live phone stream. Live telemetry belongs on the main view. A record only
   // enters the graph when it carries an authoritative sample/edge timestamp.
   const visibleProbeLogs = useMemo(
-    () => graphSourceLogs
-      .filter((record) =>
-        typeof record.timeline.deviceTimestampMs === 'number' &&
-        Number.isFinite(record.timeline.deviceTimestampMs)
-      )
-      .map((record) => ({ record, timestampMs: record.timeline.deviceTimestampMs as number }))
-      .filter((entry) => entry.timestampMs >= graphWindowStartMs && entry.timestampMs <= graphWindowEndMs)
-      .sort((a, b) => a.timestampMs - b.timestampMs || a.record.recordId.localeCompare(b.record.recordId)),
+    () => selectRecordedProbePoints(graphSourceLogs,graphWindowStartMs,graphWindowEndMs),
     [graphSourceLogs, graphWindowStartMs, graphWindowEndMs]
   );
   const visibleLampLogs = useMemo(
@@ -11531,7 +11821,7 @@ function ArcApp() {
                       <Text style={styles.probeSettingsRowTitle}>{t('settings.cloudSync')}</Text>
                       <Text style={styles.probeSettingsRowDetail}>{cloudSyncStatusLabel}</Text>
                     </View>
-                    <Switch value={cloudSyncEnabled} onValueChange={setCloudSyncEnabled} />
+                    <Switch value={cloudSyncEnabled} onValueChange={setCloudSyncEnabled} disabled={ARC_CLOUD_SYNC_VALIDATION_HOLD} />
                   </View>
 
                   <View style={styles.settingsListDivider} />
@@ -11994,7 +12284,7 @@ function ArcApp() {
                   <Text style={styles.graphHeaderButtonText} numberOfLines={1}>{t('settings.cloudSync')}</Text>
                   <Text style={styles.graphCloudSyncStatus} numberOfLines={1}>{cloudSyncStatusLabel}</Text>
                 </View>
-                <Switch value={cloudSyncEnabled} onValueChange={setCloudSyncEnabled} />
+                <Switch value={cloudSyncEnabled} onValueChange={setCloudSyncEnabled} disabled={ARC_CLOUD_SYNC_VALIDATION_HOLD} />
               </View>
 
               {/* Deliberate dead space between Cloud Sync and Exit. Storage
@@ -12368,14 +12658,16 @@ function ArcApp() {
                   </Text>
                 </View>
               </View>
-              {Platform.OS === 'android' && editingMeshNode &&
-                  (editingMeshNode.nodeKind === 'lamp' || editingMeshNode.nodeKind === 'probe') ? (
+              {editingMeshNode && ((Platform.OS === 'android' &&
+                  (editingMeshNode.nodeKind === 'lamp' || editingMeshNode.nodeKind === 'probe')) ||
+                  (Platform.OS === 'ios' && editingMeshNode.nodeKind === 'lamp')) ? (
                 <View style={styles.gatewaySetupBlock}>
                   <Text style={styles.label}>Claimed ARC device ID</Text>
                   <Text style={styles.muted}>Local BLE: {editingMeshNode.blePeripheralId ?? editingMeshNode.id}</Text>
+                  {Platform.OS==='ios'?<Text style={styles.muted}>Hardware UID: {lampHardwareIdentity[editingMeshNode.id]?.hardwareUid ?? lampHardwareIdentity[editingMeshNode.id]?.state ?? 'pending'} · {iosHardwareResolution(editingMeshNode).state}</Text>:null}
                   <Text style={styles.muted}>
                     Select the already-claimed device corresponding to this physical node.
-                    The association is saved on this phone only and does not claim or authenticate hardware.
+                    The UID must match the server-registered ARC product. Binding confirmation does not authorize firmware or change its operating mode.
                   </Text>
                   <TouchableOpacity
                     style={styles.gatewaySetupChip}
@@ -12399,7 +12691,7 @@ function ArcApp() {
                           <Text style={styles.muted}>{device.id}</Text>
                         </TouchableOpacity>
                       ))}
-                      {ownerLinkExistingTarget ? (
+                      {ownerLinkExistingTarget && Platform.OS!=='ios' ? (
                         <TouchableOpacity style={styles.gatewaySetupChip}
                           onPress={() => { setOwnerLinkTargetId(null); setOwnerLinkPickerOpen(false); }}>
                           <Text style={styles.muted}>Remove local association</Text>
@@ -12515,6 +12807,37 @@ function ArcApp() {
         </Modal>
       )}
 
+      {Platform.OS === 'ios' ? <ArcDeviceQrScanner
+        visible={iosDeviceQrScannerOpen}
+        onCancel={() => { iosDeviceQrStagedScanRef.current = null; setIosDeviceQrScannerOpen(false); }}
+        onScanned={identity => {
+          // Close UIKit's camera Modal completely before presenting the review Modal.
+          iosDeviceQrStagedScanRef.current = identity;
+          setIosDeviceQrScannerOpen(false);
+        }}
+        onDismissed={() => {
+          const identity = iosDeviceQrStagedScanRef.current;
+          iosDeviceQrStagedScanRef.current = null;
+          if (identity) handleArcDeviceQrScan(identity);
+        }}
+      /> : null}
+      {Platform.OS === 'ios' ? <ArcDeviceQrReview
+        state={iosDeviceQrReview}
+        onDismiss={closeArcDeviceQrReview}
+        onChoose={chooseArcDeviceForQr}
+        onLocal={openLocalAfterQr}
+        onOpenRegistered={device => {
+          closeArcDeviceQrReview();
+          setConnectionsSection('devices');
+          setActiveTabSafe('comms');
+          openPortalDevice(device);
+        }}
+      /> : null}
+      <HardwareAssociationModal state={mandatoryHardwareAssociation}
+        onMyDevices={()=>{if(mandatoryHardwareAssociation)hardwareOnboarding.cancel(mandatoryHardwareAssociation.nodeId);setConnectionsSection('devices');setActiveTabSafe('comms');}}
+        onSelect={id=>{if(mandatoryHardwareAssociation)void hardwareOnboarding.select(mandatoryHardwareAssociation.nodeId,id).catch(error=>setMeshStatus(String(error)));}}
+        onRefresh={()=>{if(mandatoryHardwareAssociation?.hardwareUid){hardwareBackend.refreshNext(mandatoryHardwareAssociation.hardwareUid);void hardwareOnboarding.retry(mandatoryHardwareAssociation.nodeId);}else if(mandatoryHardwareAssociation){hardwareOnboarding.cancel(mandatoryHardwareAssociation.nodeId);void mesh.disconnectNode(mandatoryHardwareAssociation.nodeId);}}}
+        onCancel={()=>{if(mandatoryHardwareAssociation){hardwareOnboarding.cancel(mandatoryHardwareAssociation.nodeId);void mesh.disconnectNode(mandatoryHardwareAssociation.nodeId);}}} />
       {Platform.OS === 'ios' && timePickerVisible && activeTimeField && (
         <Modal transparent animationType="fade">
           <View style={styles.pickerBackdrop}>
@@ -14542,8 +14865,8 @@ const createStyles = (theme: AppTheme) => StyleSheet.create({
     borderWidth: 1,
     padding: 10,
     flex: 1,
-    height: 180,
-    overflow: 'hidden',
+    height: Platform.OS === 'ios' ? iosLocalNodeGeometry.tileHeight : 180,
+    ...(Platform.OS === 'ios' ? {} : { overflow: 'hidden' as const }),
   },
   meshTileTwoColumn: {
     // Keep the last tile the same width as tiles in a complete two-column row.
@@ -14556,8 +14879,7 @@ const createStyles = (theme: AppTheme) => StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'flex-start',
     gap: 8,
-    height: 78,
-    flexShrink: 0,
+    ...(Platform.OS === 'ios' ? { minHeight: iosLocalNodeGeometry.headerMinHeight } : { height: 78, flexShrink: 0 }),
   },
   meshTileBadge: {
     width: 32,
@@ -14573,10 +14895,8 @@ const createStyles = (theme: AppTheme) => StyleSheet.create({
   },
   meshTileTitleWrap: {
     flex: 1,
-    minWidth: 0,
     gap: 2,
-    height: 78,
-    overflow: 'hidden',
+    ...(Platform.OS === 'ios' ? { minHeight: iosLocalNodeGeometry.headerMinHeight } : { minWidth: 0, height: 78, overflow: 'hidden' as const }),
   },
   meshTileGear: {
     padding: 4,
@@ -14604,7 +14924,7 @@ const createStyles = (theme: AppTheme) => StyleSheet.create({
   },
   meshTileBody: {
     flex: 1,
-    minHeight: 0,
+    ...(Platform.OS === 'ios' ? {} : { minHeight: 0 }),
     marginTop: 4,
     justifyContent: 'space-between',
   },
@@ -14620,13 +14940,13 @@ const createStyles = (theme: AppTheme) => StyleSheet.create({
     marginTop: 6,
   },
   meshTileActionSlot: {
-    height: 44,
+    height: Platform.OS === 'ios' ? iosLocalNodeGeometry.actionHeight : 44,
     justifyContent: 'flex-end',
     flexShrink: 0,
   },
   meshTileAction: {
     width: 112,
-    height: 44,
+    height: Platform.OS === 'ios' ? iosLocalNodeGeometry.actionHeight : 44,
     alignSelf: 'flex-start',
     paddingVertical: 0,
     paddingHorizontal: 10,

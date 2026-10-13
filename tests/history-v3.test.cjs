@@ -153,6 +153,8 @@ test('witness 4845 callbacks cannot close recovery expecting 4844; both records 
     probeLoggingSettingsRef: { current: {} },
     probeLoggingViewsOpenRef: { current: false },
     arcHistoryRecordToProbeStatus: () => ({}),
+    hardwareHistoryRecordId: require('../src/mesh/iosHardwareHistoryProtocol.ts').hardwareHistoryRecordId,
+    hardwareHistoryProvenance: require('../src/mesh/iosHardwareHistoryProtocol.ts').hardwareHistoryProvenance,
     appendProbeLogRecord: async r => { appended.push(Number(r.recordId.split(':').at(-1))); },
     appendRecoveredLampOperationalRecord: async (_id, r) => { await appendBarrier; appended.push(r.sequence); },
     saveArcHistoryCursor: async (_id, seq) => { assert.ok(appended.includes(seq)); saved.push(seq); },

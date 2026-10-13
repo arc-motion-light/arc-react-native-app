@@ -1,9 +1,10 @@
 import * as FileSystem from 'expo-file-system/legacy';
 
 import type { LampStatus } from './ble/bleTypes';
-import type { ArcLampHistoryRecord } from './mesh/arcHistoryProtocol';
+import { hardwareHistoryProvenance, hardwareHistoryRecordId, type HardwareHistoryProvenance, type ArcLampHistoryRecord } from './mesh/iosHardwareHistoryProtocol';
 
 export type LampOperationalRecord = {
+  hardwareProvenance?: HardwareHistoryProvenance;
   schemaVersion: 1;
   recordType: 'lamp_operational';
   recordId: string;
@@ -47,7 +48,7 @@ export type LampOperationalRecord = {
     flagsRaw: number | null;
   };
   provenance: {
-    sourcePath: 'lamp_ble_phone_bridge' | 'lamp_g4_fram_history' | 'portal_canonical';
+    sourcePath: 'lamp_ble_phone_bridge' | 'lamp_g4_fram_history' | 'lamp_wba_uid_history' | 'portal_canonical';
     power: 'derived_12v_times_measured_current' | 'unavailable' | 'reported_cloud_record';
   };
   history?: {
@@ -266,10 +267,11 @@ export const appendRecoveredLampOperationalRecord = async (
   const record: LampOperationalRecord = {
     schemaVersion: 1,
     recordType: 'lamp_operational',
-    recordId: `lamp:${lampId}:history:${history.sequence}`,
+    recordId: hardwareHistoryRecordId(history,lampId),
+    hardwareProvenance:hardwareHistoryProvenance(history),
     lampId,
     timeline: {
-      lampSampledAtMs: history.timestampValid ? history.unixTimeSeconds * 1000 : null,
+      lampSampledAtMs: history.timestampValid ? history.unixTimeSeconds * 1000 + (history.collectionMilliseconds ?? 0) : null,
       receivedAtMs,
       timestampOrigin: history.timestampValid ? 'lamp_g4_rtc' : 'unknown',
       timestampQuality: history.timestampValid ? 'edge_timestamp' : 'unavailable',
@@ -307,7 +309,7 @@ export const appendRecoveredLampOperationalRecord = async (
       flagsRaw: history.stateFlags,
     },
     provenance: {
-      sourcePath: 'lamp_g4_fram_history',
+      sourcePath: history.schemaVersion===3?'lamp_wba_uid_history':'lamp_g4_fram_history',
       power: history.powerWatts === null ? 'unavailable' : 'derived_12v_times_measured_current',
     },
     history: { sequence: history.sequence, eventKind: history.eventKind },

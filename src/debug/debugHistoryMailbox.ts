@@ -1,4 +1,4 @@
-import type { ArcHistoryRecord, ArcHistoryStatus } from '../mesh/arcHistoryProtocol';
+import type { ArcHistoryRecord, ArcHistoryStatus } from '../mesh/iosHardwareHistoryProtocol';
 
 export const DEBUG_HISTORY_MAX_RECORDS = 4096;
 export const DEBUG_HISTORY_BATCH_LIMIT = 32;
@@ -188,7 +188,7 @@ export class DebugHistoryMailbox {
     }
     if (this.phase !== 'status') return;
     this.status = Object.freeze({ ...status });
-    if (!status.ready || status.recordBytes !== 32 || ![1, 2].includes(status.recordVersion) ||
+    if (!status.ready || !((status.recordBytes===88 && status.recordVersion===3)||(status.recordBytes===32 && [1,2].includes(status.recordVersion))) ||
         !Number.isInteger(status.count) || status.count < 0 || status.count > status.capacity || status.count > DEBUG_HISTORY_MAX_RECORDS ||
         (status.count > 0 && (status.oldestSequence < 0 || status.newestSequence < status.oldestSequence ||
           status.newestSequence - status.oldestSequence + 1 !== status.count))) {
@@ -236,7 +236,7 @@ export class DebugHistoryMailbox {
     const pass = this.passes.at(-1)!;
     const expected = this.after + 1;
     if (!Number.isInteger(record.sequence) || record.sequence < 0 || record.sequence > 0xffffffff ||
-        ![1, 2].includes(record.schemaVersion) || !['probe_environment', 'lamp_operational'].includes(record.recordType)) {
+        ![1,2,3].includes(record.schemaVersion) || !['probe_environment', 'lamp_operational'].includes(record.recordType)) {
       this.fail('invalid_decoded_record'); return;
     }
     if (record.sequence > pass.through || record.sequence > this.status!.newestSequence) {

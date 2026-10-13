@@ -1,3 +1,4 @@
+import type { HardwareHistoryProvenance } from './mesh/iosHardwareHistoryProtocol';
 import * as FileSystem from 'expo-file-system/legacy';
 
 import type { ProbeSensorStatus } from './mesh/meshTypes';
@@ -19,6 +20,7 @@ export type ProbeLoggingSettings = {
 };
 
 export type ProbeLogRecord = {
+  hardwareProvenance?: HardwareHistoryProvenance;
   probeId: string;
   recordId?: string;
   deviceTimestampMs?: number | null;
@@ -207,20 +209,23 @@ export const appendProbeLogRecord = async (
   // Simultaneous telemetry events must not overwrite each other's record.
   appendQueue = appendQueue.catch(() => undefined).then(async () => {
     await ensureDirectory();
-    const ids = record.recordId ? await getKnownRecordIds() : null;
-    if (record.recordId && ids?.has(record.recordId)) return;
+    const sampleRecordId=record.recordId??record.snapshot.sampleRecordId;
+    const ids = sampleRecordId ? await getKnownRecordIds() : null;
+    if (sampleRecordId && ids?.has(sampleRecordId)) return;
     const envelope = buildProbeLogEnvelope(
       record.probeId,
       record.snapshot,
       record.syncMode ?? DEFAULT_PROBE_LOGGING_SETTINGS.syncMode,
       {
-        recordId: record.recordId,
-        deviceTimestampMs: record.deviceTimestampMs,
+        recordId: sampleRecordId,
+        storageStartedAtMs: Date.now(),
+        ...(record.deviceTimestampMs!==undefined?{deviceTimestampMs:record.deviceTimestampMs}:{}),
         receivedAtMs: record.receivedAtMs,
         timestampValid: record.timestampValid,
         timestampOrigin: record.timestampOrigin,
       }
     );
+    if(record.hardwareProvenance)envelope.hardwareProvenance=record.hardwareProvenance;
     const line = `${JSON.stringify(envelope)}\n`;
     let uri = await getActiveSegment();
     const info = await FileSystem.getInfoAsync(uri);

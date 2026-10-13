@@ -106,7 +106,21 @@ const encoded = (value: string) => encodeURIComponent(value);
 
 import type { CloudHistoryCoverage } from '../mesh/arcHistorySession';
 
+export type HardwareHistoryV4Coverage = CloudHistoryCoverage & {
+  lampHardwareUid: string;
+  journalGeneration: string;
+};
+
 export const portalClient = {
+  hardwareBinding: (uid: string) => portalFetch<{ok:true;binding:import('../mesh/hardwareOnboarding').ServerHardwareBinding|null;device?:PortalDeviceSummary;authorizedUserId:string;issuedAtMs:number;expiresAtMs:number}>(
+    `https://arc-hardware---remote-gateway-cloud-test-rrhlh3gwla-ew.a.run.app/api/portal/hardware-bindings/${encoded(uid)}`).then(r=>{
+      if(!r.binding)return null;
+      if(!r.device)throw new Error('Incomplete hardware binding response');
+      return {binding:r.binding,device:r.device,authorizedUserId:r.authorizedUserId,issuedAtMs:r.issuedAtMs,expiresAtMs:r.expiresAtMs};
+    }),
+  confirmHardwareBinding: (hardwareUid:string,deviceId:string,deviceType:import('../mesh/hardwareOnboarding').ProductType) =>
+    portalFetch<{ok:true;binding:import('../mesh/hardwareOnboarding').ServerHardwareBinding;device:PortalDeviceSummary;authorizedUserId:string;issuedAtMs:number;expiresAtMs:number}>(
+      '/api/portal/hardware-bindings',{method:'POST',body:JSON.stringify({hardwareUid,deviceId,deviceType})}),
   historyCoverage: async (lampId: string, framOldest: number, framNewest: number): Promise<CloudHistoryCoverage> => {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
@@ -120,6 +134,29 @@ export const portalClient = {
       if (result.coverage.lampId !== lampId || result.coverage.streamId !== `lamp:${lampId}:history`) throw new Error('History coverage stream mismatch');
       return result.coverage;
     } finally { clearTimeout(timer!); }
+  },
+  /** Read-only v4 coverage. Deliberately NOT used to skip physical BLE recovery
+   * until generation-scoped reconciliation is validated on real Lamp hardware. */
+  hardwareHistoryCoverage: async (
+    lampId: string, lampHardwareUid: string, journalGeneration: string,
+    framOldest: number, framNewest: number
+  ): Promise<HardwareHistoryV4Coverage> => {
+    if (!/^[0-9A-F]{24}$/.test(lampHardwareUid) || /^(0{24}|F{24})$/.test(lampHardwareUid) ||
+        !/^[0-9A-F]{16}$/.test(journalGeneration) || /^0{16}$/.test(journalGeneration) ||
+        !Number.isInteger(framOldest) || framOldest < 1 || !Number.isInteger(framNewest) ||
+        framNewest < framOldest || framNewest - framOldest >= 4096) throw new Error('Invalid v4 coverage parameters');
+    const path = `/api/app/telemetry/hardware/coverage?lampId=${encoded(lampId)}` +
+      `&lampHardwareUid=${encoded(lampHardwareUid)}&journalGeneration=${encoded(journalGeneration)}` +
+      `&framOldest=${framOldest}&framNewest=${framNewest}`;
+    const result = await portalFetch<{ ok: true; coverage: HardwareHistoryV4Coverage }>(
+      path, { retryAuth: false });
+    const coverage = result.coverage;
+    if (coverage.lampId !== lampId || coverage.lampHardwareUid !== lampHardwareUid ||
+        coverage.journalGeneration !== journalGeneration ||
+        coverage.streamId !== `lamp:${lampHardwareUid}:generation:${journalGeneration}:history`) {
+      throw new Error('Hardware history v4 coverage identity mismatch');
+    }
+    return coverage;
   },
   peopleSearch: (query: string) =>
     portalFetch<{ ok: true; users: ArcUserSummary[] }>(`/api/portal/people/search?q=${encoded(query)}`).then((r) => r.users),

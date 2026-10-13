@@ -1,3 +1,5 @@
+import { isProbeUtcMs } from './mesh/probeSampleTimeProtocol';
+import type { HardwareHistoryProvenance } from './mesh/iosHardwareHistoryProtocol';
 import type { ProbeSensorStatus } from './mesh/meshTypes';
 
 export const PROBE_LOG_SCHEMA_VERSION = 1 as const;
@@ -6,12 +8,14 @@ export type ProbeCloudSyncMode = 'local_only' | 'cloud_later';
 export type ProbeCloudSyncState = 'local' | 'queued' | 'synced';
 
 export type ProbeLogEnvelope = {
+  hardwareProvenance?: HardwareHistoryProvenance;
   schemaVersion: typeof PROBE_LOG_SCHEMA_VERSION;
   recordId: string;
   probeId: string;
   source: ProbeSensorStatus['source'];
   timeline: {
     receivedAtMs: number;
+    storageStartedAtMs?: number;
     deviceTimestampMs: number | null;
     timestampValid?: boolean;
     timestampOrigin?: 'lamp_g4_receive_rtc' | 'phone_received' | 'probe_device' | 'unknown';
@@ -66,22 +70,28 @@ export const buildProbeLogEnvelope = (
     recordId?: string;
     deviceTimestampMs?: number | null;
     receivedAtMs?: number;
+    storageStartedAtMs?: number;
     timestampValid?: boolean;
     timestampOrigin?: 'lamp_g4_receive_rtc' | 'phone_received' | 'probe_device' | 'unknown';
   }
 ): ProbeLogEnvelope => {
   const receivedAtMs = identity?.receivedAtMs ?? snapshot.updatedAt ?? Date.now();
 
+  const explicitTime=identity&&Object.prototype.hasOwnProperty.call(identity,'deviceTimestampMs');
+  const deviceTimestampMs=explicitTime?identity!.deviceTimestampMs??null:snapshot.deviceTimestampMs??null;
+  const timestampValid=identity?.timestampValid!==false&&snapshot.timestampValid!==false&&(identity?.timestampValid===true||snapshot.timestampValid===true)&&isProbeUtcMs(deviceTimestampMs);
+  const timestampOrigin=identity?.timestampOrigin??snapshot.timestampOrigin??(deviceTimestampMs==null?'phone_received':'unknown');
   return {
     schemaVersion: PROBE_LOG_SCHEMA_VERSION,
-    recordId: identity?.recordId ?? `${probeId}:${receivedAtMs}`,
+    recordId: identity?.recordId ?? snapshot.sampleRecordId ?? `${probeId}:${receivedAtMs}`,
     probeId,
     source: snapshot.source ?? null,
     timeline: {
       receivedAtMs,
-      deviceTimestampMs: identity?.deviceTimestampMs ?? null,
-      timestampValid: identity?.timestampValid ?? identity?.deviceTimestampMs != null,
-      timestampOrigin: identity?.timestampOrigin ?? (identity?.deviceTimestampMs != null ? 'probe_device' : 'phone_received'),
+      deviceTimestampMs,
+      timestampValid,
+      timestampOrigin,
+      storageStartedAtMs: identity?.storageStartedAtMs,
     },
     telemetry: {
       batteryPct: normalizeNumber(snapshot.batteryPct),

@@ -1,7 +1,12 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { mergeSequenceRanges, type HistorySequenceRange } from './arcHistorySession';
 
-const keyForLamp = (lampId: string, userId?: string) => `arc:lamp-history:v1:${encodeURIComponent(lampId)}${userId ? `:user:${encodeURIComponent(userId)}` : ''}`;
+const generations=new Map<string,string>();
+export const setArcHistoryGeneration=(lampId:string,generation:string)=>{
+  if(!/^[0-9A-F]{16}$/.test(generation) || /^0{16}$/.test(generation))throw new Error('Invalid journal generation');
+  generations.set(lampId,generation);
+};
+const keyForLamp = (lampId: string, userId?: string) => `arc:lamp-history:${generations.has(lampId)?`v4:${generations.get(lampId)}`:'v1'}:${encodeURIComponent(lampId)}${userId ? `:user:${encodeURIComponent(userId)}` : ''}`;
 const rangesKey = (lampId: string, userId?: string) => `${keyForLamp(lampId, userId)}:durable-ranges:v3`;
 let writes: Promise<void> = Promise.resolve();
 export const loadArcHistoryCursor = async (lampId: string, userId?: string): Promise<number> => {

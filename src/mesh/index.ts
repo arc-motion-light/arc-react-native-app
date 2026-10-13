@@ -1,3 +1,4 @@
+import { ProbeSampleTimeJoiner, PROBE_SAMPLE_TIME_OPCODE } from './probeSampleTimeProtocol';
 import { NativeEventEmitter, NativeModules, PermissionsAndroid, Platform } from 'react-native';
 import {
   fromBase64,
@@ -20,6 +21,8 @@ import {
   type ArcGatewayDebugStatus,
   type ArcProbeGatewayChildConfirmation,
 } from './arcMeshProtocol';
+import { hardwareUid, type HardwareIdentityEvent } from './hardwareIdentity';
+import { encodeProbeTime, encodeProbeSample, decodeProbeTimeAck, decodeProbeSampleAck, type ProbeTimeAck, type ProbeSampleAck } from './probeDirectControlProtocol';
 import { createOpenMeshClient } from './openMeshClient';
 import { encodeLampCadence, decodeLampCadence, type LampCadenceReply } from './lampCadenceProtocol';
 import {
@@ -48,19 +51,19 @@ import {
 } from './openMeshProtocol';
 import type { MeshNode, MeshScanResult, ProbeSensorStatus } from './meshTypes';
 import { clampLampIntensity } from '../lamp/lampLimits';
-import {
-  ArcHistoryOpcode,
-  decodeArcHistoryAck,
-  decodeArcHistoryRecord,
-  decodeArcHistoryStream,
-  decodeArcHistoryStatus,
-  encodeArcHistoryAck,
-  encodeArcHistoryGetAfter,
-  encodeArcHistoryGetBatch,
-  encodeArcHistoryStatusGet,
-  type ArcHistoryRecord,
-  type ArcHistoryStatus,
-} from './arcHistoryProtocol';
+import * as unchangedHistory from './arcHistoryProtocol';
+import * as iosHistory from './iosHardwareHistoryProtocol';
+import type { ArcHistoryRecord, ArcHistoryStatus } from './iosHardwareHistoryProtocol';
+const ArcHistoryOpcode=iosHistory.ArcHistoryOpcode;
+const decodeArcHistoryAck=Platform.OS==='ios'?iosHistory.decodeArcHistoryAck:unchangedHistory.decodeArcHistoryAck;
+const decodeArcHistoryRecord=(data:Uint8Array)=>(Platform.OS==='ios'?iosHistory.decodeArcHistoryRecord(data):unchangedHistory.decodeArcHistoryRecord(data)) as ArcHistoryRecord|null;
+const decodeArcHistoryStream=(data:Uint8Array)=>(Platform.OS==='ios'?iosHistory.decodeArcHistoryStream(data):unchangedHistory.decodeArcHistoryStream(data)) as ArcHistoryRecord[];
+const decodeArcHistoryStatus=(data:Uint8Array)=>(Platform.OS==='ios'?iosHistory.decodeArcHistoryStatus(data):unchangedHistory.decodeArcHistoryStatus(data)) as ArcHistoryStatus;
+const encodeArcHistoryStatusGet=Platform.OS==='ios'?iosHistory.encodeArcHistoryStatusGet:unchangedHistory.encodeArcHistoryStatusGet;
+const encodeArcHistoryGetAfter=(sequence:number,generation:string)=>Platform.OS==='ios'?iosHistory.encodeArcHistoryGetAfter(sequence,generation):unchangedHistory.encodeArcHistoryGetAfter(sequence);
+const encodeArcHistoryGetBatch=(after:number,head:number,limit:number,generation:string)=>Platform.OS==='ios'?iosHistory.encodeArcHistoryGetBatch(after,head,limit,generation):unchangedHistory.encodeArcHistoryGetBatch(after,head,limit);
+const encodeArcHistoryAck=(sequence:number,generation:string)=>Platform.OS==='ios'?iosHistory.encodeArcHistoryAck(sequence,generation):unchangedHistory.encodeArcHistoryAck(sequence);
+
 
 const OPEN_MESH_WRAPPED_OPCODES = new Set<number>([
   OpenMeshOpcode.SET_STATUS,
@@ -80,6 +83,7 @@ const OPEN_MESH_WRAPPED_OPCODES = new Set<number>([
 ]);
 
 const ARC_GATEWAY_LOADER_TX_OPCODES = new Set<number>([
+  PROBE_SAMPLE_TIME_OPCODE,
   ArcMeshProbeOpcode.TELEMETRY_STATUS,
   ArcMeshProbeOpcode.GATEWAY_CHILD_CONFIRM,
   ArcMeshProbeOpcode.GATEWAY_DEBUG_STATUS,
@@ -581,7 +585,43 @@ export type HistorySubscriptionHandlers = {
 };
 
 export const createMeshComms = () => {
+  const historyGenerations=new Map<string,string>();
+  const generationFor=(id:string)=>{if(Platform.OS!=='ios')return '';const generation=historyGenerations.get(id);if(!generation)throw new Error('Read new history status before requesting records');return generation;};
   let cadenceNonce = Date.now() >>> 0;
+  let probeNonce = (Date.now() ^ 0x5a1d09cb) >>> 0;
+  const probeCommandQueues = new Map<string, Promise<void>>();
+  const requestProbeControl = (nodeId: string, payload: Uint8Array, opcode: number, nonce: number): Promise<Uint8Array> => {
+    const previous = probeCommandQueues.get(nodeId) ?? Promise.resolve();
+    const request = previous.catch(() => undefined).then(() => new Promise<Uint8Array>((resolve, reject) => {
+      if (!emitter) { reject(new Error('Probe BLE notifications unavailable')); return; }
+      let settled = false;
+      const finish = (error?: Error, response?: Uint8Array) => {
+        if (settled) return; settled = true; clearTimeout(timer); notify.remove(); disconnected.remove();
+        if (error) reject(error); else resolve(response!);
+      };
+      const notify = emitter.addListener('MeshTelemetry', (event: any) => {
+        if (String(event?.nodeId ?? event?.id ?? '') !== nodeId) return;
+        const raw = event?.payloadBase64 ?? event?.payload ?? event?.data;
+        if (!raw) return;
+        const frame = fromBase64(String(raw));
+        if (frame.length !== 12 || frame[0] !== opcode || frame[1] !== 1) return;
+        const offset = opcode === 0x21 ? 8 : 4;
+        if (new DataView(frame.buffer,frame.byteOffset,frame.byteLength).getUint32(offset,true) !== nonce) return;
+        finish(undefined,frame);
+      });
+      const disconnected = emitter.addListener('MeshConnection', (event: any) => {
+        if (String(event?.nodeId ?? event?.id ?? '') === nodeId && !event?.connected)
+          finish(new Error('Probe BLE disconnected before confirmation'));
+      });
+      const timer = setTimeout(() => finish(new Error('Probe firmware confirmation timed out')), 5000);
+      void writeLoaderControlQueued(ensureModule(),nodeId,payload).catch(error =>
+        finish(error instanceof Error ? error : new Error(String(error))));
+    }));
+    const settled = request.then(() => undefined, () => undefined);
+    probeCommandQueues.set(nodeId,settled);
+    void settled.finally(() => { if (probeCommandQueues.get(nodeId) === settled) probeCommandQueues.delete(nodeId); });
+    return request;
+  };
   const requestLampCadence = (nodeId: string, seconds?: number, revision?: number): Promise<LampCadenceReply> => new Promise((resolve, reject) => {
     if (!emitter) { reject(new Error('Lamp telemetry notifications unavailable')); return; }
     const nonce = cadenceNonce = (cadenceNonce + 1) >>> 0 || 1;
@@ -942,6 +982,27 @@ export const createMeshComms = () => {
       });
       lastSetTimeEpochByNode.set(nodeId, safeEpoch);
     },
+    setProbeTimeEpoch: async (nodeId: string, epochSeconds: number): Promise<ProbeTimeAck | null> => {
+      if (Platform.OS !== 'ios') {
+        // Preserve existing Android 8-byte write until its native 12-byte ACK bridge is validated.
+        const payload = new Uint8Array(8);
+        payload[0]=0x20; payload[1]=1;
+        if (!Number.isInteger(epochSeconds) || epochSeconds < 1577836800 || epochSeconds > 4102444799)
+          throw new Error('Invalid Probe UTC epoch');
+        new DataView(payload.buffer).setUint32(4,epochSeconds,true);
+        await writeLoaderControlQueued(ensureModule(),nodeId,payload);
+        return null; // explicitly unconfirmed
+      }
+      const nonce = probeNonce = (probeNonce+1)>>>0 || 1;
+      const frame = await requestProbeControl(nodeId,encodeProbeTime(epochSeconds,nonce),0x21,nonce);
+      return decodeProbeTimeAck(frame,nonce,epochSeconds);
+    },
+    setProbeSampleInterval: async (nodeId: string, seconds: number): Promise<ProbeSampleAck> => {
+      if (Platform.OS !== 'ios') throw new Error('Probe Sample Apply requires validated iOS native control bridge');
+      const nonce = probeNonce = (probeNonce+1)>>>0 || 1;
+      const frame = await requestProbeControl(nodeId,encodeProbeSample(seconds,nonce),0x23,nonce);
+      return decodeProbeSampleAck(frame,nonce,seconds);
+    },
     readStatus: async (nodeId: string) => readStatusWithOpenMesh(nodeId),
     setScheduleConfigV3: async (nodeId: string, configVersion: number, input: OpenMeshLampConfig & { schema?: number }) => {
       if (typeof input.schema === 'number' && input.schema !== 3) {
@@ -1039,7 +1100,7 @@ export const createMeshComms = () => {
     requestLampCadence,
     requestHistoryAfter: async (nodeId: string, sequence: number) => {
       const module = ensureModule();
-      await writeLoaderControlQueued(module, nodeId, encodeArcHistoryGetAfter(sequence));
+      await writeLoaderControlQueued(module, nodeId, encodeArcHistoryGetAfter(sequence,generationFor(nodeId)));
     },
     requestHistoryBatch: async (
       nodeId: string,
@@ -1051,12 +1112,12 @@ export const createMeshComms = () => {
       await writeLoaderControlQueued(
         module,
         nodeId,
-        encodeArcHistoryGetBatch(afterSequence, headSequence, limit),
+        encodeArcHistoryGetBatch(afterSequence, headSequence, limit,generationFor(nodeId)),
       );
     },
     acknowledgeHistoryThrough: async (nodeId: string, sequence: number) => {
       const module = ensureModule();
-      await writeLoaderControlQueued(module, nodeId, encodeArcHistoryAck(sequence));
+      await writeLoaderControlQueued(module, nodeId, encodeArcHistoryAck(sequence,generationFor(nodeId)));
     },
     subscribeHistory: (handlers: HistorySubscriptionHandlers) => {
       if (!emitter) return () => undefined;
@@ -1068,7 +1129,10 @@ export const createMeshComms = () => {
         if (![ArcHistoryOpcode.STATUS, ArcHistoryOpcode.RECORD, ArcHistoryOpcode.ACK, ArcHistoryOpcode.STREAM].includes(data[0])) return;
         const recordContext: HistoryIngressContext = Object.freeze(handlers.captureRecordContext?.(nodeId) ?? { owner: 'NONE' });
         try {
-          if (data[0] === ArcHistoryOpcode.STATUS) handlers.onStatus?.(nodeId, decodeArcHistoryStatus(data), recordContext);
+          if (data[0] === ArcHistoryOpcode.STATUS) {
+            const status=decodeArcHistoryStatus(data);historyGenerations.set(nodeId,status.journalGeneration);
+            handlers.onStatus?.(nodeId,status,recordContext);
+          }
           if (data[0] === ArcHistoryOpcode.RECORD) handlers.onRecord?.(nodeId, decodeArcHistoryRecord(data), recordContext);
           if (data[0] === ArcHistoryOpcode.ACK) { decodeArcHistoryAck(data); handlers.onAck?.(nodeId, recordContext); }
           if (data[0] === ArcHistoryOpcode.STREAM) {
@@ -1159,6 +1223,14 @@ export const createMeshComms = () => {
       onGatewayDebug?: (gatewayNodeId: string, status: ArcGatewayDebugStatus) => void
     ) => {
       if (!emitter) return () => undefined;
+      const sampleTimes=new ProbeSampleTimeJoiner();
+      const identitySub=emitter.addListener('MeshHardwareIdentity',(event:HardwareIdentityEvent)=>{
+        if(Platform.OS!=='ios'||!event.nodeId||!Number.isInteger(event.session))return;
+        sampleTimes.identity(event.nodeId,hardwareUid(event.hardwareUid)??undefined,event.session,event.state==='identified'&&(event.deviceType==='probe'||event.deviceType==='lamp'),event.deviceType==='lamp');
+      });
+      const connectionSub=emitter.addListener('MeshConnection',(event:any)=>{
+        const id=String(event?.nodeId??event?.id??'');if(id)sampleTimes.connection(id,Boolean(event?.connected));
+      });
       const sub = emitter.addListener('MeshTelemetry', (event: any) => {
         const gatewayNodeId = String(event?.nodeId ?? event?.id ?? '');
         if (!gatewayNodeId) return;
@@ -1166,6 +1238,10 @@ export const createMeshComms = () => {
         if (!payloadBase64) return;
         const data = fromBase64(String(payloadBase64));
         if (!data.length) return;
+        if(data[0]===PROBE_SAMPLE_TIME_OPCODE){
+          if(Platform.OS==='ios')try{sampleTimes.receive(gatewayNodeId,data,Date.now());}catch(error){logTelemetry(`probe-time-drop:${gatewayNodeId}`,`[ProbeSampleTime][DROP] ${String(error)}`);}
+          return;
+        }
         const traceLine = decodeAsciiTraceLine(data);
         if (traceLine) {
           logTelemetry(`gateway-trace:${gatewayNodeId}`, `[GatewayTrace][TXT] gateway=${gatewayNodeId} ${traceLine}`);
@@ -1186,7 +1262,8 @@ export const createMeshComms = () => {
         if (data[0] === ArcMeshProbeOpcode.TELEMETRY_STATUS) {
           try {
             const frame = decodeArcProbeTelemetryStatusFrame(data);
-            const probeStatus = toProbeStatusFromArcTelemetry(frame);
+            const decodedStatus = toProbeStatusFromArcTelemetry(frame);
+            const probeStatus = Platform.OS==='ios'?sampleTimes.decorate(gatewayNodeId,decodedStatus,frame,data,Date.now()):decodedStatus;
             logTelemetry(`probe-route-telemetry:${gatewayNodeId}`,
               `[ProbeRoute][TELEMETRY][RX] gateway=${gatewayNodeId} seq=${frame.sequence} temp=${frame.bme690TemperatureC.toFixed(1)}C rh=${frame.bme690HumidityPct.toFixed(1)}% battery=${frame.batteryPct ?? 'n/a'}`
             );
@@ -1209,7 +1286,21 @@ export const createMeshComms = () => {
           logTelemetry(`probe-route-confirm-drop:${gatewayNodeId}`, `[ProbeRoute][CONFIRM][DROP] gateway=${gatewayNodeId} reason=${String(error?.message ?? error)} len=${data.length}`);
         }
       });
-      return () => sub.remove();
+      return () => {sub.remove();identitySub.remove();connectionSub.remove();};
+    },
+    subscribeHardwareIdentity: (onChange: (event: HardwareIdentityEvent) => void) => {
+      if (!emitter) return () => undefined;
+      const sessions = new Map<string, number>();
+      const sub=emitter.addListener('MeshHardwareIdentity',(event: HardwareIdentityEvent)=>{
+        if(!event.nodeId || !Number.isInteger(event.session) || event.session<(sessions.get(event.nodeId) ?? -1))return;
+        if(!['pending','identified','unavailable','incompatible','disconnected'].includes(event.state))return;
+        sessions.set(event.nodeId,event.session);
+        const uid=hardwareUid(event.hardwareUid);
+        const kind=event.deviceType;
+        const validType=kind==='lamp'||kind==='probe';
+        onChange({...event,state:event.state==='identified' && (!uid||!validType)?'incompatible':event.state,hardwareUid:uid ?? undefined});
+      });
+      return ()=>sub.remove();
     },
     subscribeConnection: (onChange: (nodeId: string, connected: boolean) => void) => {
       if (!emitter) return () => undefined;
@@ -1217,6 +1308,7 @@ export const createMeshComms = () => {
         const nodeId = String(event?.nodeId ?? event?.id ?? '');
         if (!nodeId) return;
         const connected = Boolean(event?.connected);
+        if(!connected)historyGenerations.delete(nodeId);
         onChange(nodeId, connected);
       });
       return () => sub.remove();

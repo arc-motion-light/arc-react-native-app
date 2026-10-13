@@ -100,7 +100,8 @@ test('command boundary rechecks live grants, rejects remote paths/cache and guar
   const source = app.slice(start, end).replace('const authorizeLampCommand =', 'exports.authorize =');
   for (const scenario of ['allowed', 'revoked', 'remote', 'cache', 'switched']) {
     const cloud = device('lamp', { canControl: true }); let calls = 0;
-    const sandbox = { exports: {}, isCurrentArcLamp, meshEnabled: true, connected: true, portalInventoryCached: scenario === 'cache',
+    const sandbox = { exports: {}, Platform: { OS: 'ios' }, iosHardwareResolution: () => ({ state: 'known' }),
+      isCurrentArcLamp, meshEnabled: true, connected: true, portalInventoryCached: scenario === 'cache',
       currentCloudUserRef: { current: 'test-user' }, knownCanonicalDeviceIdsRef: { current: new Set([cloud.id]) },
       selectedLampViewRef: { current: deviceView(local('lamp', scenario !== 'remote'), [cloud], true) },
       setPortalDevices: () => {}, setStatus: () => {}, portalErrorMessage: String,

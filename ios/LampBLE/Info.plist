@@ -44,6 +44,8 @@
 	</dict>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>ARC uses Bluetooth to scan, connect, provision, and communicate with nearby ARC devices.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>ARC uses the camera to scan device QR codes when you choose Add Device.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>ARC uses your location to calculate local sunrise and sunset times for light schedules.</string>
 	<key>NSMotionUsageDescription</key>

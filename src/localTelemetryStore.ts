@@ -15,6 +15,8 @@ import {
   loadAllProbeLogRecords,
 } from './probeLogger';
 import type { ProbeLogEnvelope } from './probeDataFormat';
+import { buildHardwareHistoryUpload, isHardwareUploadRecord } from './cloud/hardwareHistoryV4';
+import type { HardwareHistoryUploadRecord } from './cloud/hardwareHistoryV4';
 
 const cloudSyncPreferenceKey = 'arc:cloud-sync:enabled:v1';
 const syncDirectory = `${FileSystem.documentDirectory ?? ''}arc-local-telemetry`;
@@ -63,7 +65,7 @@ export type LocalTelemetryDeleteOptions = {
   deviceKey?: string | null;
 };
 
-export type CloudTelemetryUploadRecord = {
+export type LegacyCloudTelemetryUploadRecord = {
   recordId: string;
   recordType: 'lamp_operational' | 'probe_environment';
   lampId: string;
@@ -76,6 +78,8 @@ export type CloudTelemetryUploadRecord = {
   phoneReceivedAtMs: number;
   payload: LampOperationalRecord | ProbeLogEnvelope;
 };
+
+export type CloudTelemetryUploadRecord = LegacyCloudTelemetryUploadRecord | HardwareHistoryUploadRecord;
 
 export type CloudTelemetryBatchResult = {
   acceptedRecordIds: string[];
@@ -136,20 +140,22 @@ const historyIdentity = (recordId: string) => {
 };
 
 const lampLocalRecord = (record: LampOperationalRecord): LocalRecord => {
+  const hardware = buildHardwareHistoryUpload(record);
   const identity = historyIdentity(record.recordId);
   const measurementTimestampMs = record.timeline.lampSampledAtMs;
-  const eligible = Boolean(
+  const eligible = Boolean(hardware || (
+    !record.hardwareProvenance &&
     identity &&
     measurementTimestampMs != null &&
     record.timeline.timestampOrigin === 'lamp_g4_rtc'
-  );
+  ));
   return {
     kind: 'lamp',
     deviceId: record.lampId,
     recordId: record.recordId,
     timestampMs: measurementTimestampMs ?? record.timeline.receivedAtMs,
     eligible,
-    uploadRecord: eligible && identity && measurementTimestampMs != null
+    uploadRecord: hardware ?? (eligible && identity && measurementTimestampMs != null
       ? {
           recordId: record.recordId,
           recordType: 'lamp_operational',
@@ -160,26 +166,28 @@ const lampLocalRecord = (record: LampOperationalRecord): LocalRecord => {
           phoneReceivedAtMs: record.timeline.receivedAtMs,
           payload: record,
         }
-      : null,
+      : null),
   };
 };
 
 const probeLocalRecord = (record: ProbeLogEnvelope): LocalRecord => {
+  const hardware = buildHardwareHistoryUpload(record);
   const identity = historyIdentity(record.recordId);
   const measurementTimestampMs = record.timeline.deviceTimestampMs;
-  const eligible = Boolean(
+  const eligible = Boolean(hardware || (
+    !record.hardwareProvenance &&
     identity &&
     measurementTimestampMs != null &&
     record.timeline.timestampValid !== false &&
     record.timeline.timestampOrigin === 'lamp_g4_receive_rtc'
-  );
+  ));
   return {
     kind: 'probe',
     deviceId: record.probeId,
     recordId: record.recordId,
     timestampMs: measurementTimestampMs ?? record.timeline.receivedAtMs,
     eligible,
-    uploadRecord: eligible && identity && measurementTimestampMs != null
+    uploadRecord: hardware ?? (eligible && identity && measurementTimestampMs != null
       ? {
           recordId: record.recordId,
           recordType: 'probe_environment',
@@ -191,7 +199,7 @@ const probeLocalRecord = (record: ProbeLogEnvelope): LocalRecord => {
           phoneReceivedAtMs: record.timeline.receivedAtMs,
           payload: record,
         }
-      : null,
+      : null),
   };
 };
 
@@ -363,8 +371,20 @@ export const drainCloudTelemetry = async (
     });
     let uploaded = 0;
     let failed = 0;
-    for (let offset = 0; offset < pending.length; offset += uploadBatchSize) {
-      const batch = pending.slice(offset, offset + uploadBatchSize);
+    // Never combine the strict hardware-v4 schema with the legacy v3 schema in one HTTP batch.
+    // A retried v4 event is idempotent even if another group was already acknowledged.
+    const groups = [
+      pending.filter(record => !isHardwareUploadRecord(record.uploadRecord)),
+      pending.filter(record => isHardwareUploadRecord(record.uploadRecord)),
+    ];
+    const batches = groups.flatMap(group => {
+      const chunks: typeof group[] = [];
+      for (let offset = 0; offset < group.length; offset += uploadBatchSize) {
+        chunks.push(group.slice(offset, offset + uploadBatchSize));
+      }
+      return chunks;
+    });
+    for (const batch of batches) {
       batch.forEach((record) => { index[record.recordId] = { ...index[record.recordId], state: 'uploading' }; });
       await saveSyncIndex(index);
       try {

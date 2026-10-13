@@ -29,6 +29,7 @@ import {
 import { updateProfile } from 'firebase/auth';
 import type { ProbeLogEnvelope } from '../probeDataFormat';
 import type { CloudTelemetryBatchResult, CloudTelemetryUploadRecord } from '../localTelemetryStore';
+import { isHardwareUploadRecord } from './hardwareHistoryV4';
 
 declare const process: { env?: Record<string, string | undefined> } | undefined;
 
@@ -257,6 +258,7 @@ export const demoClaim: ArcCloudDeviceClaim = {
 
 const arcCloudSnapshotUrl = 'https://remote-gateway-cloud-rrhlh3gwla-ew.a.run.app/api/dashboard/snapshot';
 const arcCloudTelemetryBatchUrl = 'https://remote-gateway-cloud-rrhlh3gwla-ew.a.run.app/api/app/telemetry/batch';
+const arcCloudHardwareHistoryBatchUrl = 'https://remote-gateway-cloud-rrhlh3gwla-ew.a.run.app/api/app/telemetry/hardware/batch';
 const arcCloudDeviceClaimUrl = 'https://remote-gateway-cloud-rrhlh3gwla-ew.a.run.app/api/app/devices/claim';
 const arcCloudDevicesUrl = 'https://remote-gateway-cloud-rrhlh3gwla-ew.a.run.app/api/app/devices';
 
@@ -337,10 +339,16 @@ export const uploadArcCloudTelemetryBatch = async (
     console.log('[CloudSync][AUTH] email_unverified');
     throw new Error('Verify your email before enabling ARC Cloud Sync.');
   }
-  console.log(`[CloudSync][AUTH] ready organizationId=${organizationId} records=${records.length}`);
+  if (!records.length) return { acceptedRecordIds: [], duplicateRecordIds: [] };
+  const hardware = isHardwareUploadRecord(records[0]);
+  if (records.some(record => isHardwareUploadRecord(record) !== hardware)) {
+    throw new Error('Mixed v3/v4 cloud upload batch rejected');
+  }
+  const endpoint = hardware ? '/api/app/telemetry/hardware/batch' : '/api/app/telemetry/batch';
   const token = await user.getIdToken();
-  console.log(`[CloudSync][HTTP][START] endpoint=/api/app/telemetry/batch records=${records.length}`);
-  const response = await fetch(arcCloudTelemetryBatchUrl, {
+  console.log(`[CloudSync][AUTH] ready organizationId=${organizationId} records=${records.length}`);
+  console.log(`[CloudSync][HTTP][START] endpoint=${endpoint} records=${records.length}`);
+  const response = await fetch(hardware ? arcCloudHardwareHistoryBatchUrl : arcCloudTelemetryBatchUrl, {
     method: 'POST',
     headers: {
       authorization: `Bearer ${token}`,

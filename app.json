@@ -28,14 +28,22 @@
           "UIInterfaceOrientationPortraitUpsideDown",
           "UIInterfaceOrientationLandscapeLeft",
           "UIInterfaceOrientationLandscapeRight"
-        ]
+        ],
+        "NSCameraUsageDescription": "ARC uses the camera to scan device QR codes when you choose Add Device."
       }
     },
     "web": {
       "bundler": "metro"
     },
     "plugins": [
-      "@react-native-community/datetimepicker"
+      "@react-native-community/datetimepicker",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "ARC uses the camera to scan device QR codes when you choose Add Device.",
+          "recordAudioAndroid": false
+        }
+      ]
     ]
   }
 }

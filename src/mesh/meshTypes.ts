@@ -15,6 +15,16 @@ export type ProbeGatewayRouteStatus = {
 };
 
 export type ProbeSensorStatus = {
+  sampleSequence?: number | null;
+  sampleTickMs?: number | null;
+  sensorValidMask?: number | null;
+  sensorErrorMask?: number | null;
+  sampleHardwareUid?: string;
+  sampleRecordId?: string;
+  sampleTimePresent?: boolean;
+  deviceTimestampMs?: number | null;
+  timestampValid?: boolean;
+  timestampOrigin?: 'probe_device' | 'unknown';
   temperatureC?: number | null;
   humidityPct?: number | null;
   pressureHpa?: number | null;
@@ -65,6 +75,8 @@ export type ProbeSensorStatus = {
 
 export type MeshNode = {
   id: string;
+  /** Canonical projection from the server UID binding; never derived from BLE id. */
+  canonicalDeviceId?: string;
   uuid?: string | null;
   unicastAddress?: number | null;
   unicastHex?: string | null;

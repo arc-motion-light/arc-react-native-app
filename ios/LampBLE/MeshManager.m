@@ -15,6 +15,11 @@
 @property(nonatomic, strong) CBPeripheral *telemetryPeripheral;
 @property(nonatomic, strong) CBPeripheral *routeConfigPeripheral;
 @property(nonatomic, strong) CBPeripheral *probeDiagnosticPeripheral;
+@property(nonatomic, strong) CBCharacteristic *identityRxCharacteristic;
+@property(nonatomic, assign) uint32_t identityToken;
+@property(nonatomic, assign) BOOL identityStarted;
+@property(nonatomic, assign) BOOL identityPending;
+@property(nonatomic, strong) NSTimer *identityTimer;
 @property(nonatomic, strong) CBCharacteristic *telemetryEnvCharacteristic;
 @property(nonatomic, strong) CBCharacteristic *telemetryGatewayCharacteristic;
 @property(nonatomic, strong) CBCharacteristic *routeThreadDebugCharacteristic;
@@ -37,6 +42,8 @@
 @property(nonatomic, strong) NSData *routePayload;
 @property(nonatomic, strong) NSTimer *telemetryTimer;
 @property(nonatomic, assign) NSInteger telemetryDiscoveryAttempt;
+@property(nonatomic, assign) NSInteger telemetryReconnectAttempt;
+@property(nonatomic, assign) NSUInteger telemetryReconnectGeneration;
 @property(nonatomic, assign) NSInteger nextUnicastAddress;
 @property(nonatomic, assign) NSInteger telemetryConfigVersion;
 @property(nonatomic, assign) double airTempC;
@@ -91,6 +98,7 @@ RCT_EXPORT_MODULE(MeshManager)
 {
   return @[
     @"MeshTelemetry",
+    @"MeshHardwareIdentity",
     @"MeshConnection",
     @"MeshProvisioningState",
     @"MeshProvisioningCapabilities",
@@ -190,12 +198,19 @@ RCT_EXPORT_METHOD(writeLoaderControl:(NSString *)nodeId
     const BOOL preparePwmFrequency = payload.length == 10 && bytes != NULL && bytes[0] == 0x42;
     const BOOL manualPower = payload.length == 10 && bytes != NULL && bytes[0] == 0x43;
     const BOOL manualPowerTarget = payload.length == 10 && bytes != NULL && bytes[0] == 0x44;
-    const BOOL historyStatus = payload.length == 2 && bytes != NULL && bytes[0] == 0x62 && bytes[1] == 0x01;
+    const BOOL historyStatus = payload.length == 2 && bytes != NULL && bytes[0] == 0x62 && bytes[1] == 0x03;
     const BOOL historyGet =
       bytes != NULL &&
-      ((payload.length == 6 && bytes[0] == 0x64 && bytes[1] == 0x01) ||
-       (payload.length == 11 && bytes[0] == 0x64 && bytes[1] == 0x02));
-    const BOOL historyAck = payload.length == 6 && bytes != NULL && bytes[0] == 0x66 && bytes[1] == 0x01;
+      ((payload.length == 14 && bytes[0] == 0x64 && bytes[1] == 0x03) ||
+       (payload.length == 19 && bytes[0] == 0x64 && bytes[1] == 0x03));
+    const BOOL historyAck = payload.length == 14 && bytes != NULL && bytes[0] == 0x66 && bytes[1] == 0x03;
+    const BOOL hardwareIdentity = payload.length == 8 && bytes != NULL && bytes[0] == 0x78 && bytes[1] == 1 && bytes[2] == 0 && bytes[3] == 0;
+    // 12-byte nonce-correlated Probe controls require an application-level ACK.
+    // Retain the legacy 8-byte time write for older firmware (unconfirmed).
+    const BOOL probeTimeSync = (payload.length == 8 || payload.length == 12) && bytes != NULL &&
+      bytes[0] == 0x20 && bytes[1] == 1 && bytes[2] == 0 && bytes[3] == 0;
+    const BOOL probeSampleSet = payload.length == 12 && bytes != NULL &&
+      bytes[0] == 0x22 && bytes[1] == 1 && bytes[2] == 0 && bytes[3] == 0;
     const BOOL lampCadence = bytes != NULL && payload.length >= 2 && bytes[1] == 1 &&
       ((payload.length == 6 && bytes[0] == 0x74) || (payload.length == 12 && bytes[0] == 0x75));
     const BOOL openMeshShort = payload.length == 11 && bytes != NULL &&
@@ -207,7 +222,7 @@ RCT_EXPORT_METHOD(writeLoaderControl:(NSString *)nodeId
     const BOOL openMeshConfigSet = payload.length == 31 && bytes != NULL && bytes[0] == 0x30;
     const BOOL openMeshConfigGet = payload.length == 2 && bytes != NULL && bytes[0] == 0x32 && bytes[1] == 0x03;
     if (!manualChannels && !manualFan && !preparePwmFrequency && !manualPower && !manualPowerTarget &&
-        !historyStatus && !historyGet && !historyAck && !lampCadence && !openMeshShort && !openMeshConfigSet && !openMeshConfigGet) {
+        !hardwareIdentity && !probeTimeSync && !probeSampleSet && !historyStatus && !historyGet && !historyAck && !lampCadence && !openMeshShort && !openMeshConfigSet && !openMeshConfigGet) {
       reject(@"LOADER_CONTROL_PAYLOAD", @"Unsupported Loader RX command or payload length.", nil);
       return;
     }
@@ -567,13 +582,14 @@ RCT_EXPORT_METHOD(configureProbeGatewayRoute:(NSDictionary *)params resolver:(RC
   if ([self.telemetryNodeId isEqualToString:nodeId] && self.telemetryPeripheral != nil) {
     if (self.telemetryPeripheral.state == CBPeripheralStateConnected) {
       [self startTelemetryTimer];
-      [self beginTelemetryDiscoveryForPeripheral:self.telemetryPeripheral];
-    } else {
-      [self.centralManager connectPeripheral:self.telemetryPeripheral options:nil];
+      if (!self.telemetryEnvCharacteristic || !self.telemetryGatewayCharacteristic) [self beginTelemetryDiscoveryForPeripheral:self.telemetryPeripheral];
+    } else if(self.telemetryPeripheral.state == CBPeripheralStateDisconnected) {
+      [self.centralManager connectPeripheral:self.telemetryPeripheral options:[self telemetryConnectOptions]];
     }
     return;
   }
 
+  ++self.telemetryReconnectGeneration;self.telemetryReconnectAttempt=0;
   NSString *previousNodeId = self.telemetryNodeId;
   CBPeripheral *previousPeripheral = self.telemetryPeripheral;
   if (previousPeripheral != nil) {
@@ -596,6 +612,8 @@ RCT_EXPORT_METHOD(configureProbeGatewayRoute:(NSDictionary *)params resolver:(RC
   self.telemetryEnvCharacteristic = nil;
   self.telemetryGatewayCharacteristic = nil;
   self.telemetryRssi = nil;
+  [self.identityTimer invalidate];self.identityTimer=nil;self.identityPending=NO;self.identityStarted=NO;
+  self.identityRxCharacteristic=nil;++self.identityToken;
   self.telemetryDiscoveryAttempt = 0;
   self.telemetryNodeId = nodeId;
   // ENV bytes belong to the peripheral that produced them. Never carry a
@@ -615,7 +633,7 @@ RCT_EXPORT_METHOD(configureProbeGatewayRoute:(NSDictionary *)params resolver:(RC
     [self startTelemetryTimer];
     [self beginTelemetryDiscoveryForPeripheral:self.telemetryPeripheral];
   } else {
-    [self.centralManager connectPeripheral:self.telemetryPeripheral options:nil];
+    [self.centralManager connectPeripheral:self.telemetryPeripheral options:[self telemetryConnectOptions]];
   }
 }
 
@@ -661,6 +679,10 @@ RCT_EXPORT_METHOD(configureProbeGatewayRoute:(NSDictionary *)params resolver:(RC
 
 - (void)stopTelemetry
 {
+  ++self.telemetryReconnectGeneration;self.telemetryReconnectAttempt=0;
+  [self.identityTimer invalidate];self.identityTimer=nil;self.identityPending=NO;self.identityStarted=NO;
+  self.identityRxCharacteristic=nil;++self.identityToken;
+  [self emitHardwareIdentityState:@"disconnected" uid:nil];
   [self.telemetryTimer invalidate];
   self.telemetryTimer = nil;
   self.telemetryEnvCharacteristic = nil;
@@ -1065,10 +1087,33 @@ RCT_EXPORT_METHOD(configureProbeGatewayRoute:(NSDictionary *)params resolver:(RC
 - (void)ensureCentralManager
 {
   if (self.centralManager == nil) {
-    self.centralManager = [[CBCentralManager alloc] initWithDelegate:self queue:dispatch_get_main_queue()];
+    self.centralManager = [[CBCentralManager alloc] initWithDelegate:self queue:dispatch_get_main_queue() options:@{CBCentralManagerOptionRestoreIdentifierKey:@"arc.mesh.central.v1"}];
   }
 }
 
+- (NSDictionary *)telemetryConnectOptions
+{
+  if (@available(iOS 17.0, *)) return @{CBConnectPeripheralOptionEnableAutoReconnect:@YES};
+  return nil;
+}
+- (void)centralManager:(CBCentralManager *)central willRestoreState:(NSDictionary<NSString *,id> *)state
+{
+  /* Restore candidates only. No auto-claim, owner inference or private command. */
+  for(CBPeripheral *peripheral in state[CBCentralManagerRestoredStatePeripheralsKey]) {
+    self.discoveredPeripherals[peripheral.identifier.UUIDString]=peripheral;
+    peripheral.delegate=self;
+  }
+}
+- (void)scheduleTelemetryReconnect:(CBPeripheral *)peripheral
+{
+  if(peripheral!=self.telemetryPeripheral || !self.requestedTelemetryNodeId || self.telemetryReconnectAttempt>=5)return;
+  NSUInteger generation=self.telemetryReconnectGeneration;
+  NSTimeInterval delay=MIN(30.0,pow(2.0,++self.telemetryReconnectAttempt));
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(delay*NSEC_PER_SEC)),dispatch_get_main_queue(),^{
+    if(generation!=self.telemetryReconnectGeneration || peripheral!=self.telemetryPeripheral || !self.requestedTelemetryNodeId || self.centralManager.state!=CBManagerStatePoweredOn || peripheral.state!=CBPeripheralStateDisconnected)return;
+    [self.centralManager connectPeripheral:peripheral options:[self telemetryConnectOptions]];
+  });
+}
 - (NSString *)bluetoothStateMessage
 {
   switch (self.centralManager.state) {
@@ -1221,6 +1266,7 @@ RCT_EXPORT_METHOD(configureProbeGatewayRoute:(NSDictionary *)params resolver:(RC
   }
 
   if (peripheral == self.telemetryPeripheral) {
+    self.telemetryReconnectAttempt=0;++self.telemetryReconnectGeneration;
     [self startTelemetryTimer];
     [self setNodeId:[self nodeIdForPeripheral:peripheral] physicallyConnected:YES];
     [self beginTelemetryDiscoveryForPeripheral:peripheral];
@@ -1242,6 +1288,7 @@ RCT_EXPORT_METHOD(configureProbeGatewayRoute:(NSDictionary *)params resolver:(RC
     self.telemetryTimer = nil;
     [self setNodeId:[self nodeIdForPeripheral:peripheral] physicallyConnected:NO];
     [self emitDebug:self.telemetryNodeId message:@"ARC physical BLE connection failed; node remains offline."];
+    [self scheduleTelemetryReconnect:peripheral];
   }
 
   if (peripheral != self.provisioningPeripheral || self.linkReject == nil) {
@@ -1254,9 +1301,83 @@ RCT_EXPORT_METHOD(configureProbeGatewayRoute:(NSDictionary *)params resolver:(RC
   reject(@"LINK_FAILED", message, error);
 }
 
+/* Identification is local and public. This event never grants command access. */
+- (void)emitHardwareIdentityState:(NSString *)state uid:(NSString *)uid
+{
+  if (!self.hasListeners || !self.telemetryNodeId) return;
+  NSMutableDictionary *body=[@{@"nodeId":self.telemetryNodeId,@"state":state,
+    @"session":@(self.identityToken)} mutableCopy];
+  if(uid)body[@"hardwareUid"]=uid;
+  [self sendEventWithName:@"MeshHardwareIdentity" body:body];
+}
+
+- (void)beginHardwareIdentityIfReady
+{
+  if(self.identityStarted || !self.identityRxCharacteristic || !self.telemetryGatewayCharacteristic.isNotifying ||
+     !self.telemetryEnvCharacteristic.isNotifying || self.telemetryPeripheral.state!=CBPeripheralStateConnected)return;
+  /* Public identity query is supported by both Lamp and Probe firmware. */
+  NSDictionary *node=self.provisionedNodes[self.telemetryNodeId];
+  [self emitDebug:self.telemetryNodeId message:[NSString stringWithFormat:
+    @"[HardwareIdentity][PRECHECK] node=%@ kind=%@ provisioned=%@",
+    self.telemetryNodeId, node[@"nodeKind"] ?: @"(nil)", node ? @"YES" : @"NO"]];
+  NSString *nodeKind=node[@"nodeKind"];
+  /* A newly discovered device has no provisioned node yet. Allow only the
+   * public, nonce-checked hardware UID read; do not grant any access here. */
+  if(nodeKind != nil && ![nodeKind isEqualToString:@"lamp"] && ![nodeKind isEqualToString:@"probe"]) {
+    self.identityStarted=YES;++self.identityToken;
+    [self emitDebug:self.telemetryNodeId message:[NSString stringWithFormat:
+      @"[HardwareIdentity][REJECT_PRECHECK] node=%@ kind=%@",
+      self.telemetryNodeId, node[@"nodeKind"] ?: @"(nil)"]];
+    [self emitHardwareIdentityState:@"pending" uid:nil];[self emitHardwareIdentityState:@"incompatible" uid:nil];return;
+  }
+  self.identityStarted=YES;self.identityPending=YES;
+  uint32_t token=++self.identityToken;
+  if(token==0)token=++self.identityToken;
+  uint8_t request[8]={0x78,1,0,0,(uint8_t)token,(uint8_t)(token>>8),(uint8_t)(token>>16),(uint8_t)(token>>24)};
+  [self emitHardwareIdentityState:@"pending" uid:nil];
+  __weak typeof(self) weakSelf=self;
+  self.identityTimer=[NSTimer scheduledTimerWithTimeInterval:5 repeats:NO block:^(NSTimer *timer){
+    __strong typeof(weakSelf) self=weakSelf;
+    if(self.identityPending && self.identityToken==token){self.identityPending=NO;[self emitHardwareIdentityState:@"unavailable" uid:nil];}
+  }];
+  CBCharacteristicWriteType type=(self.identityRxCharacteristic.properties & CBCharacteristicPropertyWrite)
+    ? CBCharacteristicWriteWithResponse : CBCharacteristicWriteWithoutResponse;
+  [self.telemetryPeripheral writeValue:[NSData dataWithBytes:request length:8] forCharacteristic:self.identityRxCharacteristic type:type];
+}
+
+- (void)receiveHardwareIdentity:(NSData *)data
+{
+  const uint8_t *p=data.bytes;
+  if(!self.identityPending || data.length<8)return;
+  uint32_t token=(uint32_t)p[4]|(uint32_t)p[5]<<8|(uint32_t)p[6]<<16|(uint32_t)p[7]<<24;
+  if(token!=self.identityToken)return;
+  self.identityPending=NO;[self.identityTimer invalidate];self.identityTimer=nil;
+  BOOL valid=data.length==20 && p[0]==0x79 && p[1]==1 && p[2]==0 && (p[3]==1 || p[3]==2);
+  BOOL zero=YES, erased=YES;
+  if(valid)for(unsigned i=8;i<20;++i){zero &= p[i]==0;erased &= p[i]==255;}
+  if(!valid || zero || erased){
+    [self emitDebug:self.telemetryNodeId message:[NSString stringWithFormat:
+      @"[HardwareIdentity][REJECT_RESPONSE] length=%lu opcode=0x%02X version=%u status=%u type=%u zero=%d erased=%d",
+      (unsigned long)data.length, p[0], p[1], p[2], p[3], zero, erased]];
+    [self emitHardwareIdentityState:@"incompatible" uid:nil];return;
+  }
+  NSMutableString *uid=[NSMutableString new];
+  for(unsigned i=8;i<20;++i)[uid appendFormat:@"%02X",p[i]];
+  [self sendEventWithName:@"MeshHardwareIdentity" body:@{@"nodeId":self.telemetryNodeId,@"state":@"identified",
+    @"session":@(self.identityToken),@"hardwareUid":uid,@"deviceType":p[3]==1?@"lamp":@"probe"}];
+}
+
 - (void)centralManager:(CBCentralManager *)central didDisconnectPeripheral:(CBPeripheral *)peripheral error:(NSError *)error
+{ [self handleDisconnect:peripheral error:error reconnecting:NO]; }
+- (void)centralManager:(CBCentralManager *)central didDisconnectPeripheral:(CBPeripheral *)peripheral timestamp:(CFAbsoluteTime)timestamp isReconnecting:(BOOL)isReconnecting error:(NSError *)error
+{ [self handleDisconnect:peripheral error:error reconnecting:isReconnecting]; }
+- (void)handleDisconnect:(CBPeripheral *)peripheral error:(NSError *)error reconnecting:(BOOL)isReconnecting
 {
   if (peripheral == self.telemetryPeripheral) {
+    [self.identityTimer invalidate]; self.identityTimer=nil;
+    self.identityPending=NO; self.identityStarted=NO; self.identityRxCharacteristic=nil;
+    ++self.identityToken;
+    [self emitHardwareIdentityState:@"disconnected" uid:nil];
     NSString *telemetryNodeId = [self nodeIdForPeripheral:peripheral];
     [self.telemetryTimer invalidate];
     self.telemetryTimer = nil;
@@ -1266,6 +1387,7 @@ RCT_EXPORT_METHOD(configureProbeGatewayRoute:(NSDictionary *)params resolver:(RC
     self.probeEnvData = nil;
     [self setNodeId:telemetryNodeId physicallyConnected:NO];
     [self emitDebug:telemetryNodeId message:@"ARC physical BLE link disconnected; retained as a known offline node."];
+    if(!isReconnecting)[self scheduleTelemetryReconnect:peripheral];
   }
 
   if (peripheral != self.provisioningPeripheral) {
@@ -1316,7 +1438,7 @@ RCT_EXPORT_METHOD(configureProbeGatewayRoute:(NSDictionary *)params resolver:(RC
   CBUUID *gatewayUuid = [self bleSensorLoaderTxCharacteristicUUID];
   for (CBService *service in peripheral.services) {
     if ([service.UUID isEqual:[self bleSensorServiceUUID]]) {
-      [peripheral discoverCharacteristics:@[envUuid, gatewayUuid] forService:service];
+      [peripheral discoverCharacteristics:@[envUuid, gatewayUuid, [self bleSensorLoaderRxCharacteristicUUID]] forService:service];
       return;
     }
   }
@@ -1386,9 +1508,12 @@ RCT_EXPORT_METHOD(configureProbeGatewayRoute:(NSDictionary *)params resolver:(RC
         [peripheral setNotifyValue:YES forCharacteristic:characteristic];
       }
       subscribedGateway = YES;
+    } else if ([characteristic.UUID isEqual:[self bleSensorLoaderRxCharacteristicUUID]]) {
+      self.identityRxCharacteristic = characteristic;
     }
   }
 
+  [self beginHardwareIdentityIfReady];
   if (subscribedEnv && subscribedGateway) {
     [self emitDebug:self.telemetryNodeId message:@"[TelemetrySubscribe][OK] subscribed to ENV and Loader TX."];
   } else if (subscribedEnv) {
@@ -1438,7 +1563,12 @@ RCT_EXPORT_METHOD(configureProbeGatewayRoute:(NSDictionary *)params resolver:(RC
   if ([characteristic.UUID isEqual:[self bleSensorEnvCharacteristicUUID]]) {
     [self parseEnvCharacteristicData:characteristic.value];
   } else if ([characteristic.UUID isEqual:[self bleSensorLoaderTxCharacteristicUUID]]) {
-    [self parseGatewayCharacteristicData:characteristic.value];
+    const uint8_t *bytes=characteristic.value.bytes;
+    if (characteristic.value.length && bytes[0]==0x79) {
+      [self receiveHardwareIdentity:characteristic.value];
+    } else {
+      [self parseGatewayCharacteristicData:characteristic.value];
+    }
   }
 }
 
@@ -1450,6 +1580,13 @@ didUpdateNotificationStateForCharacteristic:(CBCharacteristic *)characteristic
   if (![characteristic.UUID isEqual:[self bleSensorEnvCharacteristicUUID]] &&
       ![characteristic.UUID isEqual:[self bleSensorLoaderTxCharacteristicUUID]]) return;
 
+  if (error == nil && characteristic.isNotifying) [self beginHardwareIdentityIfReady];
+  if ([characteristic.UUID isEqual:[self bleSensorLoaderTxCharacteristicUUID]] &&
+      (error != nil || !characteristic.isNotifying)) {
+    [self.identityTimer invalidate]; self.identityTimer=nil;
+    self.identityPending=NO;
+    [self emitHardwareIdentityState:@"unavailable" uid:nil];
+  }
   NSString *channel = [characteristic.UUID isEqual:[self bleSensorLoaderTxCharacteristicUUID]]
     ? @"LoaderTX"
     : @"ENV";
@@ -1466,6 +1603,10 @@ didUpdateNotificationStateForCharacteristic:(CBCharacteristic *)characteristic
 
 - (void)peripheral:(CBPeripheral *)peripheral didWriteValueForCharacteristic:(CBCharacteristic *)characteristic error:(NSError *)error
 {
+  if (peripheral==self.telemetryPeripheral && characteristic==self.identityRxCharacteristic && self.identityPending && error!=nil) {
+    self.identityPending=NO; [self.identityTimer invalidate]; self.identityTimer=nil;
+    [self emitHardwareIdentityState:@"unavailable" uid:nil];
+  }
   if (peripheral != self.routeConfigPeripheral || ![characteristic.UUID isEqual:[self bleSensorLoaderRxCharacteristicUUID]]) {
     return;
   }
