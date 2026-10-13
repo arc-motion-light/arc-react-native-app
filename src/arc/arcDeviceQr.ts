@@ -23,8 +23,19 @@ export function parseArcPublicDeviceQr(raw: string): ArcPublicDeviceQr {
   if (!/^[A-Za-z0-9_-]{1,1024}$/.test(encoded)) {
     throw new Error('Invalid ARC device QR encoding.');
   }
-  const bytes = Buffer.from(encoded, 'base64url');
-  if (bytes.toString('base64url') !== encoded || bytes.length > 768) {
+  // React Native's Buffer polyfill does not necessarily support the
+  // Node-specific 'base64url' encoding. Use portable standard Base64.
+  const base64 = encoded.replace(/-/g, '+').replace(/_/g, '/');
+  const paddedBase64 = base64.padEnd(Math.ceil(base64.length / 4) * 4, '=');
+  const bytes = Buffer.from(paddedBase64, 'base64');
+
+  // Round-trip back to *unpadded* Base64URL. This rejects malformed padding,
+  // noncanonical trailing bits, and decoders that silently ignore bad input.
+  const canonicalBase64Url = bytes.toString('base64')
+    .replace(/=+$/, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+  if (canonicalBase64Url !== encoded || bytes.length > 768) {
     throw new Error('Invalid ARC device QR payload.');
   }
   let value: unknown;
