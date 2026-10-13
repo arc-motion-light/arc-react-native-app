@@ -8,6 +8,16 @@ ARC is being built as a connected platform for intelligent lighting, environment
 
 We are glad you are here. Whether you are a developer, researcher, educator, or simply curious about how connected systems come together, you are welcome to explore the work and follow its progress.
 
+## Latest development
+
+**13 October 2026 — QR device identification on iOS.** An ARC Probe T label was scanned with the iPhone app, and its public hardware identity was matched to a device registered to the signed-in account.
+
+**Development focus — ARC Probe** Following significant progress on ARC Lamp, we have temporarily shifted our development focus to Probe T, advancing the shared wireless, hardware identity, and telemetry architecture. Once the current development phase is complete, we will return to ARC Lamp and integrate these improvements into the lighting platform.
+
+We are also developing **ARC Secure Core**, our emerging security architecture for device-side authorization and encrypted local communication, designed around the hardware security capabilities of ST's wireless microcontrollers.
+
+[Development changelog](CHANGELOG.md) · [ARC Secure Core: security architecture and progress](docs/ARC_SECURE_CORE.md)
+
 ## A look inside ARC
 
 <p align="center">
